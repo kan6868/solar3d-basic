@@ -41,5 +41,4 @@ loads stays cached, so switching is instant.
 | `docs/API.md` | plugin.s3d API reference. |
 | `assets/anim/*.obj.txt` | Flag (30 frames) and fish (24 frames) animations. |
 | `assets/anim/animals/` | [Kenney Animal Kit](https://kenney.nl) (CC0). The `.obj.txt` copies are what the demo loads, because Android builds drop `*.obj` files. |
-| `assets/anim/train/` | [Kenney Train Kit](https://kenney.nl) (CC0). Not used by this demo; the `TrainDemo` project uses copies of it. |
 | `config.lua`, `build.settings` | Landscape, 1280 x 720 content area. |
