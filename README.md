@@ -5,7 +5,6 @@ depth testing, lighting, shadows, fog, post-processing and OBJ models. It is bui
 so it works with a stock Solar2D engine, and 3D objects are ordinary display objects that mix with your 2D UI.
 
 - **API reference:** [docs/API.md](docs/API.md) (every function, option and default)
-- **Plugin overview, installing, building:** [../s3d-plugin/README.md](../s3d-plugin/README.md)
 
 ## What the demo shows
 
