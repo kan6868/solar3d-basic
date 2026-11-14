@@ -1,6 +1,6 @@
-# S3DDemo
+# S3DBasic
 
-Demo project for **plugin.s3d**, a native plugin that adds basic 3D to [Solar2D](https://solar2d.com): 3D meshes with
+Project for **plugin.s3d**, a native plugin that adds basic 3D to [Solar2D](https://solar2d.com): 3D meshes with
 depth testing, lighting, shadows, fog, post-processing and OBJ models. It is built only on Solar2D's public native API,
 so it works with a stock Solar2D engine, and 3D objects are ordinary display objects that mix with your 2D UI.
 
@@ -31,13 +31,6 @@ so it works with a stock Solar2D engine, and 3D objects are ordinary display obj
 **Style** switches between the soft look (hemisphere light, AO, soft shadows, tone mapping, focus area) and the plain
 lighting of earlier versions. **AO** turns ambient occlusion on or off in either style; the AO baked when the torus
 loads stays cached, so switching is instant.
-
-## Running
-
-- **Windows Simulator:** install the plugin (`build.bat install` in `s3d-plugin`), or put `plugin.s3d.dll` in this
-  folder; `main.lua` loads a DLL found here first. The demo needs plugin version 0.6.0 or later.
-- **Android:** install the plugin, then build from the Simulator. `build.settings` already declares
-  `publisherId = "com.s3d"` and the depth buffer setting.
 
 ## Files
 
