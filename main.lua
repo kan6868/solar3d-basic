@@ -115,7 +115,7 @@ title.anchorX = 0
 local info = display.newText{ parent = ui, text = "", x = L + 16, y = T + 54, font = native.systemFont, fontSize = 18 }
 info.anchorX = 0
 
-local state = { fxaa = true, fog = true, shadow = true, grade = true, style = true, ao = true, sunOrbit = true, anim = true }
+local state = { fxaa = true, fog = true, shadow = true, grade = true, style = false, ao = true, sunOrbit = true, anim = true }
 
 -- "Style" on: soft pastel look (hemisphere ambient, ambient occlusion, soft shadows, ACES tone mapping, focus area
 -- around the camera target). Off: plain light as in earlier versions.
