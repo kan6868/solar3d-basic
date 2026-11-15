@@ -17,6 +17,8 @@ so it works with a stock Solar2D engine, and 3D objects are ordinary display obj
 - a light that orbits the scene, with a small "sun" marking where it is,
 - camera controls and touch picking.
 
+https://github.com/user-attachments/assets/7b069da8-0e75-4782-9bc3-4ad79b0860c4
+
 ## Controls
 
 | Input | Action |
