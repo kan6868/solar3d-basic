@@ -1,6 +1,6 @@
 # plugin.s3d API reference
 
-Version 0.6.0.
+Version 0.8.0.
 
 ```lua
 local s3d = require( "plugin.s3d" )
@@ -9,9 +9,10 @@ local s3d = require( "plugin.s3d" )
 - [Conventions](#conventions)
 - [Module](#module): `version`, `backend`, `supported`, `isSupported`, `isMobile`, `init`
 - [Scenes](#scenes): `newScene`, `newPostProcess`
-- [Creating objects](#creating-objects): `newCube`, `newSphere`, `newCylinder`, `newCapsule`, `newPlane`, `loadOBJ`
-- [Object methods](#object-methods): transform, render state, shadows, effects
+- [Creating objects](#creating-objects): `newCube`, `newSphere`, `newCylinder`, `newCapsule`, `newPlane`, `loadOBJ`, `newSky`
+- [Object methods](#object-methods): transform, render state, shadows, effects, reflections
 - [Frame animation](#frame-animation): `loadOBJAnimation` and its methods
+- [Dynamic meshes](#dynamic-meshes): `newMesh`, `newGrid` and their methods
 - [Camera](#camera): `setCamera`, `getCamera`, `orbit`
 - [Light](#light): `setLight`
 - [Fog](#fog): `setFog`
@@ -102,6 +103,7 @@ All constructors take a `parent` group and an optional `opts` table and return a
 | `s3d.newCapsule( parent, radius, height, segments, rings, [opts] )` | Capsule along Y. `height` is the distance between the hemisphere centers (total height = `height + 2 * radius`). Defaults: 0.25, 1, 20, 6. |
 | `s3d.newPlane( parent, width, depth, [opts] )` | Plane in XZ facing +Y, centered. `opts.uvRepeat` repeats the texture (set `display.setDefault( "textureWrapX"/"textureWrapY", "repeat" )` before loading it). |
 | `s3d.loadOBJ( parent, filename, [opts] )` | Wavefront OBJ model. |
+| `s3d.newSky( parent, texture, [opts] )` | Sky dome, see [Sky](#sky). |
 
 ### Common options
 
@@ -114,7 +116,27 @@ All constructors take a `parent` group and an optional `opts` table and return a
 | `effect` | Any effect name, e.g. `"filter.s3d.normals"` or your own. |
 | `cull` | `false` draws both sides (for open meshes like flags). |
 | `castShadow` | `true` casts a shadow (shadow map or planar, see [Shadows](#shadows)). |
+| `reflection` | Table for [`setReflection`](#reflections), e.g. `{ texture = "sky.png" }`. Needs `texture`. |
 | `x`, `y`, `z` | Initial position. |
+
+### Sky
+
+`s3d.newSky( parent, texture, [opts] )` puts an equirectangular (2:1) image on a sphere seen from inside. The dome is
+unlit and has no distance fog (with fog on it fades into the fog color towards the horizon, see `setFog`'s
+`skyHorizon`), is moved to the front of `parent`'s drawing order (index 1, drawn first), does not write depth (so
+every object covers it), and follows the camera, so it looks infinitely far away. It uses the same mapping as
+[`setReflection`](#reflections): reflections of the same image line up with the sky.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `radius` | 90% of the camera's far plane | Must stay inside the far plane. |
+| `segments`, `rings` | `48`, `24` | Sphere resolution. |
+| `baseDir` | `system.ResourceDirectory` | Base directory for `texture`. |
+| `color` | | Tint, `{ r, g, b }`. |
+
+Load the image with `display.setDefault( "textureWrapX", "repeat" )` so it wraps without a seam; reflections then reuse
+the same texture. Set the fog color to the image's horizon color so fogged objects blend into the sky; below the
+horizon the image is seen past the edge of your ground. Remove the sky with `display.remove( sky )`.
 
 ### OBJ files
 
@@ -153,6 +175,30 @@ Readable fields: `obj.position3d`, `obj.rotation3d`, `obj.scale3d` (tables `{ x,
 | `obj:setDepthWrite( on )` | Depth writing (default on). Turn off for transparent objects. |
 | `obj:setEffect( name, [uses] )` | Switch the effect. See [Custom effects](#custom-effects) for `uses`. |
 | `obj:castShadow( on )` | Start or stop casting a shadow. The object must already be in a group. |
+| `obj:setReflection( r )` | Mirror an environment image on the surface; `false` turns it off. See [Reflections](#reflections). |
+
+### Reflections
+
+`obj:setReflection{ texture = "sky.png", strength = 0.5, fresnel = 0.04, blur = 0, rotation = 0 }` mirrors an
+**equirectangular** (360° x 180°, usually 2:1) environment image on the object, like chrome, glass, polished paint or
+water reflecting the sky. Grazing angles reflect more than surfaces seen head-on (Schlick's Fresnel term).
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `texture` | required the first time | Equirectangular image. Later calls can leave it out to change only the other fields. |
+| `baseDir` | `system.ResourceDirectory` | Base directory for `texture`. |
+| `strength` | `0.5` | Overall amount, 0..1. |
+| `fresnel` | `0.04` | Share reflected when seen head-on (F0): about 0.02 water, 0.04 glass and plastic, 0.5-0.9 metals. |
+| `blur` | `0` | Mipmap bias for rough surfaces. Needs the image loaded with mipmaps (otherwise no effect); a thin seam can show where the image wraps around. |
+| `rotation` | `0` | Turns the environment around the Y axis, in degrees. |
+
+- The image is mapped like `s3d.newSphere`'s UVs: the center column faces +Z, the top row is straight up. A sky dome
+  made with `newSphere` (`unlit = true, cull = false`) and the same image therefore lines up with the reflections.
+- The object needs `opts.texture` (the demos use a small white image plus `color`): its paint becomes composite,
+  `paint1` = its texture and `paint2` = the environment. `setFillColor` tints the surface but not the reflection.
+- Effect: `filter.s3d.reflect` (lit + reflection). Fog, shadows, ambient occlusion and the focus area still apply.
+- Only the environment image is reflected, not the other objects in the scene.
+- Cost: one extra texture read and a few math operations per pixel.
 
 ## Frame animation
 
@@ -208,6 +254,93 @@ hero:play( "wave" )
 
 Memory: each frame keeps one position and one normal buffer (24 bytes per vertex), so a 3,000-vertex model with 60
 frames uses about 4 MB.
+
+## Dynamic meshes
+
+Meshes whose vertices you change while the app runs: water, terrain sculpting, cloth, soft bodies, procedural shapes.
+The plugin keeps the vertex list in C. After an edit it rebuilds the triangle list and the normals in C and hands them to
+the geometry writers, so Lua only touches the values that change and shading and shadows follow the new shape.
+A 65 x 65 height field (4,225 vertices, 8,192 triangles) takes about 0.15 ms per update on a desktop CPU, on top of
+whatever your own Lua code does to compute the heights.
+
+### `s3d.newMesh( parent, opts )`
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `vertices` | required | `{ x, y, z, x, y, z, ... }` |
+| `uvs` | all `0` | `{ u, v, ... }`, one pair per vertex. |
+| `indices` | | `{ i1, i2, i3, ... }`, 1-based, three per triangle, front face counter-clockwise. Without indices every three vertices form one triangle. |
+| `normals` | `"smooth"` | `"smooth"`: averaged over the triangles that share a vertex index (weighted by area). `"flat"`: one normal per triangle. |
+
+All [common options](#common-options) apply too, except baked ambient occlusion (the shape changes). The shader's
+darkening of walls near the floor still works.
+
+```lua
+-- a quad that bends
+local quad = s3d.newMesh( scene, {
+    vertices = { -1, 0, -1,  1, 0, -1,  1, 0, 1,  -1, 0, 1 },
+    uvs = { 0, 0,  1, 0,  1, 1,  0, 1 },
+    indices = { 1, 4, 3,  1, 3, 2 },
+    texture = "assets/crate.png", cull = false,
+} )
+Runtime:addEventListener( "enterFrame", function( e )
+    quad:setVertex( 3, 1, 0.5 * math.sin( e.time / 300 ), 1 )
+end )
+```
+
+### `s3d.newGrid( parent, width, depth, [cols], [rows], [opts] )`
+
+A height field on the XZ plane, centered on the object's origin: `cols x rows` cells (default 32 x 32),
+`(cols + 1) x (rows + 1)` vertices. Column `i` goes from 0 to `cols` along +X, row `j` from 0 to `rows` along +Z.
+Vertices are numbered row by row, X fastest: vertex `j * ( cols + 1 ) + i + 1`.
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `heights` | all `0` | A table in vertex order, or `function( x, z, i, j ) return height end`. |
+| `uvRepeat` | `1` | How many times the texture repeats across the grid (as `newPlane`). |
+
+Plus every `newMesh` option except `vertices`, `uvs` and `indices`.
+
+### Methods
+
+| Method / field | Description |
+| --- | --- |
+| `obj:setVertices( list, [first] )` | Copy `{ x, y, z, ... }` into the vertices starting at vertex `first` (default 1). Applied immediately. |
+| `obj:setVertex( i, x, y, z )` | Move one vertex (1-based). `nil` keeps a coordinate. Applied by `updateMesh()` or at the start of the next frame. |
+| `obj:getVertex( i )` | Returns `x, y, z` of a vertex, in the object's own coordinates. |
+| `obj:updateMesh()` | Apply pending `setVertex` / `setHeight` edits now. |
+| `obj:setNormals( mode )` | Switch between `"smooth"` and `"flat"` normals. |
+| `obj.meshVertexCount` | Number of vertices you edit (`vertexCount3d` counts the drawn, unindexed vertices). |
+| `grid:setHeights( heights, [scale], [offset] )` | Set the height of every vertex from a table in vertex order (`offset + scale * h`). Applied immediately. The fastest way to animate a grid: one call per frame. |
+| `grid:setHeight( i, j, h )` | One vertex, by column and row (0-based). Applied like `setVertex`. |
+| `grid:getHeight( i, j )` | Height of a vertex. |
+| `grid:heightAt( x, z )` | Height at a point in the grid's own coordinates, interpolated between the 4 nearest vertices; `nil` outside. |
+| `grid:cellAt( x, z )` | Column and row of the vertex nearest to a point in the grid's own coordinates; `nil` outside. |
+| `grid.cols`, `grid.rows`, `grid.gridWidth`, `grid.gridDepth` | Size of the grid. |
+
+Edits with `setVertex` / `setHeight` made in an `enterFrame` listener show up one frame later unless you call
+`updateMesh()` after them. `setVertices` and `setHeights` apply right away.
+
+```lua
+-- ripples: a two-buffer wave simulation, written to the grid once per frame
+local N = 49
+local pond = s3d.newGrid( scene, 4, 4, N - 1, N - 1, { texture = "assets/white.png", color = { 0.3, 0.58, 0.78 } } )
+local cur, prev = {}, {}
+for k = 1, N * N do cur[k], prev[k] = 0, 0 end
+Runtime:addEventListener( "enterFrame", function()
+    for j = 1, N - 2 do
+        for i = 1, N - 2 do
+            local k = j * N + i + 1
+            prev[k] = ( ( cur[k - 1] + cur[k + 1] + cur[k - N] + cur[k + N] ) * 0.5 - prev[k] ) * 0.985
+        end
+    end
+    cur, prev = prev, cur
+    pond:setHeights( cur )
+end )
+-- drop a stone: cur[ j * N + i + 1 ] = -0.05
+```
+
+Memory: about 24 bytes per vertex and 84 bytes per triangle in C, plus the display object and its Lua vertex tables.
 
 ## Camera
 
@@ -301,8 +434,12 @@ Linear fog by camera depth, computed per pixel. Applies to the `lit`, `unlit` an
 | `color` | `{ 0.7, 0.8, 0.9 }` | Fog color; usually the same as the post-process `clearColor`. |
 | `start` | `10` | Distance where fog starts. |
 | `["end"]` (or `finish`) | `40` | Distance where fog is complete. |
+| `skyHorizon` | `0.15` | Sky domes (`newSky`) fade into the fog color from this height down to the horizon, and stay fog-colored below it (sine of the angle: 0.15 is about 9 degrees). |
 
 `s3d.setFog( false )` turns fog off.
+
+With a sky dome, use the image's color at the horizon as the fog color, and make the ground reach past the fog's `end`:
+the fogged ground then meets the sky without an edge.
 
 ## Shadows
 
@@ -377,6 +514,8 @@ end )
 | --- | --- |
 | `filter.s3d.lit` | Default. Texture × (ambient + light × shadow), plus fog. |
 | `filter.s3d.unlit` | Texture and fill color only, plus fog. Good for skies, glowing objects, the demo's sun. |
+| `filter.s3d.reflect` | `lit` plus an environment reflection; set by `setReflection` (needs a composite paint). |
+| `filter.s3d.sky` | Texture and fill color only, no fog. Used by `newSky`. |
 | `filter.s3d.normals` | Shows normals as colors, for debugging. |
 | `filter.s3d.shadow` | Used internally for planar shadows. |
 | `filter.s3d.depth` | Used internally for the shadow map pass. |
@@ -406,7 +545,8 @@ obj:setEffect( "filter.game.toon", { light = true, fog = false, shadow = false }
 
 The second argument of `setEffect` tells the plugin which uniforms the effect declares, so it never writes a uniform
 that does not exist (Solar2D would print a warning every frame). Defaults: `light = true`, `fog = true`, `shadow = false`,
-`style = false` (`style = true`: the effect declares all six `u_S3D_Ambient*` / `u_S3D_AOParams` / `u_S3D_Focus*` uniforms).
+`style = false` (`style = true`: the effect declares all six `u_S3D_Ambient*` / `u_S3D_AOParams` / `u_S3D_Focus*` uniforms),
+`env = false` (`env = true`: the effect declares `u_S3D_Eye` and `u_S3D_Env`).
 
 What the plugin provides:
 
@@ -426,7 +566,10 @@ What the plugin provides:
 | `u_S3D_AmbientSky`, `u_S3D_AmbientGround` | uniform `vec4` | rgb: hemisphere ambient colors. Needs `style = true`. |
 | `u_S3D_AOParams` | uniform `vec4` | x: AO strength, y: contact strength, z: contact height, w: ground y. Needs `style = true`. |
 | `u_S3D_Focus`, `u_S3D_FocusParams`, `u_S3D_FocusColor` | uniform `vec4` | Focus area (see `setFocus`). Needs `style = true`. |
+| `u_S3D_Eye` | uniform `vec4` | xyz: camera position. Needs `env = true`. |
+| `u_S3D_Env` | uniform `vec4` | This object's reflection: x: strength, y: F0, z: blur, w: rotation (radians). Needs `env = true`. |
 
 The varyings are declared by the shell transform; do not declare them again. The fog and shadow helpers used by the
 built-in effects (`S3D_ApplyFog`, `S3D_ShadowLit`, `S3D_ShadowVisibility`) are in `src/s3d.lua` and can be copied into
-your own shaders, as can the style helpers (`S3D_Ambient`, `S3D_Occlusion`, `S3D_ApplyFocus`).
+your own shaders, as can the style helpers (`S3D_Ambient`, `S3D_Occlusion`, `S3D_ApplyFocus`) and the reflection helpers
+(`S3D_EnvColor`, `S3D_ApplyReflection`).
