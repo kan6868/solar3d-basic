@@ -6,13 +6,18 @@ settings =
         supported = { "landscapeLeft", "landscapeRight" },
     },
 
-    -- Install the plugin with "build.bat install" in the s3d-plugin folder.
-    -- In the Windows Simulator a plugin.s3d.dll in the project folder takes precedence (see the top of main.lua).
-    plugins =
-    {
-        ["plugin.s3d"] = { publisherId = "com.s3d" },
+    plugins = {
+        ["plugin.s3d"] = { publisherId = "com.solartools", 
+            supportedPlatforms = {
+                ["win32-sim"] = {
+                    url = "https://github.com/kan6868/solar3d-basic/releases/download/v0.8.0/plugin.s3d-win32-sim.tgz"
+                },
+                ["android"] = {
+                    url = "https://github.com/kan6868/solar3d-basic/releases/download/v0.8.0/plugin.s3d-android.tgz"
+                }
+            } 
+        },
     },
-
     android =
     {
         minSdkVersion = "21",
