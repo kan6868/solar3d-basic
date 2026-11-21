@@ -208,6 +208,30 @@ P_COLOR vec4 FragmentKernel( P_UV vec2 texCoord )
 }
 ]]
 
+-- Sprites (s3d.newSprite): alpha-tested, so they write depth without sorting (pixels below 50% alpha are cut out)
+local FRAG_SPRITE = FOG .. [[
+
+P_COLOR vec4 FragmentKernel( P_UV vec2 texCoord )
+{
+    P_COLOR vec4 c = CoronaColorScale( texture2D( CoronaSampler0, texCoord ) );
+    if ( c.a < 0.5 ) { discard; }
+    return S3D_ApplyFog( c );
+}
+]]
+local FRAG_SPRITE_LIT, spriteLitPatched = FRAG_LIT:gsub( "P_COLOR vec4 c = texture2D%( CoronaSampler0, texCoord %);",
+    "P_COLOR vec4 c = texture2D( CoronaSampler0, texCoord );\n    if ( c.a * CoronaColorScale( vec4( 1.0 ) ).a < 0.5 ) { discard; }", 1 )
+assert( spriteLitPatched == 1, "s3d: sprite shader patch failed" )
+local FRAG_DEPTH_SPRITE = [[
+P_COLOR vec4 FragmentKernel( P_UV vec2 texCoord )
+{
+    if ( texture2D( CoronaSampler0, texCoord ).a < 0.5 ) { discard; }
+    P_DEFAULT float z = clamp( v_S3D_ShadowPos.z / v_S3D_ShadowPos.w * 0.5 + 0.5, 0.0, 1.0 );
+    P_DEFAULT vec3 enc = fract( z * vec3( 1.0, 255.0, 65025.0 ) );
+    enc -= enc.yzz * vec3( 1.0 / 255.0, 1.0 / 255.0, 0.0 );
+    return vec4( enc, 1.0 );
+}
+]]
+
 local FRAG_UNLIT_NOFOG = [[
 P_COLOR vec4 FragmentKernel( P_UV vec2 texCoord )
 {
@@ -307,6 +331,12 @@ M.EFFECT_LIT = "filter.s3d.lit"
 M.EFFECT_UNLIT = "filter.s3d.unlit"
 M.EFFECT_REFLECT = "filter.s3d.reflect"
 M.EFFECT_SKY = "filter.s3d.sky"
+M.EFFECT_SPRITE = "filter.s3d.sprite"
+M.EFFECT_SPRITE_LIT = "filter.s3d.spritelit"
+M.EFFECT_DEPTH_SPRITE = "filter.s3d.depthsprite"
+M.EFFECT_LIT_INST = "filter.s3d.litinst"
+M.EFFECT_UNLIT_INST = "filter.s3d.unlitinst"
+M.EFFECT_DEPTH_INST = "filter.s3d.depthinst"
 M.EFFECT_NORMALS = "filter.s3d.normals"
 M.EFFECT_SHADOW = "filter.s3d.shadow"
 M.EFFECT_DEPTH = "filter.s3d.depth"
@@ -332,12 +362,26 @@ M.supported = ( backend ~= "vulkanBackend" )
 
 function M.isSupported() return M.supported end
 
-local function define( name, fragment )
+local function define( name, fragment, vertexExtension )
     graphics.defineEffect{
         language = "glsl", category = "filter", group = "s3d", name = name,
-        shellTransform = "s3d", dataType = "s3d",
+        shellTransform = "s3d", dataType = "s3d", vertexExtension = vertexExtension,
         fragment = fragment,
     }
+end
+
+-- GPU instancing (s3d.newInstances): one mesh drawn many times in one draw call; each instance has a position + scale,
+-- a rotation quaternion and a color, applied in the vertex shader (see the shell transform in s3d.c).
+local INSTANCE_EXTENSION = "s3dInst"
+local function defineInstancing()
+    local support = system.getInfo( "instancingSupport" )
+    if not support or not graphics.defineVertexExtension then return false end
+    local ok = graphics.defineVertexExtension{ name = INSTANCE_EXTENSION,
+        { name = "s3dInstPose", type = "float", componentCount = 4, instancesToReplicate = 1 },  -- x, y, z, scale
+        { name = "s3dInstRot", type = "float", componentCount = 4, instancesToReplicate = 1 },   -- quaternion x, y, z, w
+        { name = "s3dInstColor", type = "float", componentCount = 4, instancesToReplicate = 1 }, -- r, g, b, a
+    }
+    return ok ~= false
 end
 
 function M.init()
@@ -355,9 +399,18 @@ function M.init()
     define( "unlit", M.supported and FRAG_UNLIT or FRAG_UNLIT_NOFOG )
     define( "reflect", M.supported and FRAG_REFLECT or FRAG_UNLIT_NOFOG )
     define( "sky", M.supported and FRAG_SKY or FRAG_UNLIT_NOFOG )
+    define( "sprite", M.supported and FRAG_SPRITE or FRAG_UNLIT_NOFOG )
+    define( "spritelit", M.supported and FRAG_SPRITE_LIT or FRAG_UNLIT_NOFOG )
+    define( "depthsprite", M.supported and FRAG_DEPTH_SPRITE or FRAG_UNLIT_NOFOG )
     define( "normals", FRAG_NORMALS )
     define( "shadow", M.supported and FRAG_SHADOW or FRAG_UNLIT_NOFOG )
     define( "depth", M.supported and FRAG_DEPTH or FRAG_UNLIT_NOFOG )
+    M.instancing = M.supported and defineInstancing() or false
+    if M.instancing then
+        define( "litinst", FRAG_LIT, INSTANCE_EXTENSION )
+        define( "unlitinst", FRAG_UNLIT, INSTANCE_EXTENSION )
+        define( "depthinst", FRAG_DEPTH, INSTANCE_EXTENSION )
+    end
     graphics.defineEffect{
         language = "glsl", category = "filter", group = "s3d", name = "post",
         uniformData = {
@@ -367,7 +420,7 @@ function M.init()
         },
         fragment = FRAG_POST,
     }
-    Runtime:addEventListener( "enterFrame", function() C.beginFrame(); M._flushDynamic() end )
+    Runtime:addEventListener( "enterFrame", function( e ) C.beginFrame(); M._flushDynamic(); M._stepSprites( e.time ); M._stepModels( e.time ) end )
     M.setCamera( camera )
     M.setLight( light )
 end
@@ -725,6 +778,10 @@ local EFFECT_USES = {
     ["filter.s3d.reflect"] = { light = true, fog = true, shadow = true, style = true, env = true },
     ["filter.s3d.unlit"] = { light = false, fog = true, shadow = false },
     ["filter.s3d.sky"] = { light = false, fog = true, shadow = false },
+    ["filter.s3d.sprite"] = { light = false, fog = true, shadow = false },
+    ["filter.s3d.spritelit"] = { light = true, fog = true, shadow = true, style = true },
+    ["filter.s3d.litinst"] = { light = true, fog = true, shadow = true, style = true },
+    ["filter.s3d.unlitinst"] = { light = false, fog = true, shadow = false },
     ["filter.s3d.shadow"] = { light = false, fog = true, shadow = false },
     ["filter.s3d.normals"] = { light = false, fog = false, shadow = false },
     ["filter.s3d.depth"] = { light = false, fog = false, shadow = false },
@@ -740,6 +797,7 @@ function methods:setEffect( name, uses )
     if not uses.shadow then f = f + 1024 end
     if uses.style then f = f + 2048 end
     if uses.env then f = f + 4096 end
+    if self._s3dBillboard then f = f + self._s3dBillboard end
     self._s3dFlags = f
     self.fill.effect = name
     self.fill.effect.s3dNormals = self._s3dNormals
@@ -783,9 +841,19 @@ local function addCaster( obj )
     layer:insert( layer.numChildren, c ) -- right before the end marker
     local ox, oy = c.path:getVertexOffset()
     c.x, c.y = ox, oy
-    c.fill.effect = M.EFFECT_DEPTH
-    c.fill.effect.s3dFlags = 2 + 32 + 64 + 1024 + 128 -- no cull, shadow pass copy
+    if obj._s3dInst then c.fillExtension = INSTANCE_EXTENSION end
+    if ( obj._s3dBillboard or obj._s3dAlphaCut ) and obj._s3dTexture then
+        -- sprites and alpha-masked models: the caster needs the image (alpha cut-out) and, for sprites, the current frame's UVs
+        c.fill = { type = "image", filename = obj._s3dTexture, baseDir = obj._s3dBaseDir }
+        c.fill.effect = M.EFFECT_DEPTH_SPRITE
+        c.fill.effect.s3dFlags = 2 + 32 + 64 + 1024 + 128 + ( obj._s3dBillboard or 0 )
+    else
+        c.fill.effect = obj._s3dInst and M.EFFECT_DEPTH_INST or M.EFFECT_DEPTH
+        c.fill.effect.s3dFlags = 2 + 32 + 64 + 1024 + 128 -- no cull, shadow pass copy
+    end
     obj._s3dCaster = c
+    if obj._s3dBillboard and obj._s3dUV then obj:_applyUV( c ) end
+    if obj._s3dInst then obj:_copyInstancesTo( c ) end
 end
 
 local function hookFinalize( obj )
@@ -804,6 +872,7 @@ function methods:castShadow( on )
         return self
     end
     if not self._s3dGeom then return self end
+    if self._s3dBlend then return self end -- see-through parts (glTF BLEND) do not cast shadows
     local parent = self.parent
     if not parent then return self end
     if shadowMode == "map" then
@@ -813,6 +882,8 @@ function methods:castShadow( on )
         return self
     end
     if self._s3dShadow then return self end
+    if self._s3dInst then return self end -- planar shadows are projected on the CPU: not available for instances
+    if self._s3dBillboard then return self end -- sprites: shadow map mode only (planar shadows would be solid quads)
     local layer = parent._s3dShadowLayer
     if not layer then
         layer = display.newGroup()
@@ -840,12 +911,17 @@ end
 local function finalize( parent, b, opts )
     opts = opts or {}
     -- degenerate triangle at the origin: keeps the object's 2D bounds around (0, 0) so Solar2D does not cull it by mistake
-    b:vertex( 0, 0, 0, 0, 0, 0, 0, 1 ); b:vertex( 1, 1, 0, 0, 0, 0, 0, 1 ); b:vertex( 1, 1, 0, 0, 0, 0, 0, 1 )
+    if not opts._hasDegenerate then
+        b:vertex( 0, 0, 0, 0, 0, 0, 0, 1 ); b:vertex( 1, 1, 0, 0, 0, 0, 0, 1 ); b:vertex( 1, 1, 0, 0, 0, 0, 0, 1 )
+    end
 
     local mesh = display.newMesh{ mode = "triangles", vertices = b.P, uvs = b.U, hasZ = true }
     if not mesh then error( "s3d: display.newMesh failed", 3 ) end
+    if opts._extension then mesh.fillExtension = opts._extension end -- before any effect that uses it
     if parent then
         parent:insert( mesh )
+        -- see-through parts (glTF BLEND) are drawn after the opaque objects, then the planar shadows
+        if parent._s3dBlendLayer then parent._s3dBlendLayer:toFront() end
         if parent._s3dShadowLayer then parent._s3dShadowLayer:toFront() end -- planar shadows are always drawn last
     end
     mesh._s3dGeom = b
@@ -871,7 +947,9 @@ local function finalize( parent, b, opts )
     -- ambient occlusion: OBJ models when s3d.setAmbientOcclusion is on (opts.ao overrides), cached per file + scale
     local wantAO = opts.ao
     if wantAO == nil then wantAO = ao.enabled and opts._aoKey ~= nil end
-    if wantAO and M.supported then
+    if opts._ao then
+        mesh._s3dAO = opts._ao
+    elseif wantAO and M.supported then
         local dist = opts.aoDistance or ao.distance
         local key = opts._aoKey and ( opts._aoKey .. "|" .. dist .. "|" .. ao.rays )
         local buf = key and aoCache[key]
@@ -882,6 +960,7 @@ local function finalize( parent, b, opts )
         mesh._s3dAO = buf
     end
 
+    if opts._preEffect then opts._preEffect( mesh ) end
     mesh:setEffect( opts.effect or ( opts.unlit and M.EFFECT_UNLIT ) or M.EFFECT_LIT )
     if opts.reflection then mesh:setReflection( opts.reflection ) end
     if not M.supported then mesh.isVisible = false end
@@ -1157,6 +1236,391 @@ function M.newGrid( parent, width, depth, cols, rows, opts )
     return obj
 end
 
+
+-- ---------------------------------------------------------------------------
+-- Instances: many copies of one model in a single draw call (GPU instancing).
+-- s3d.newInstances( parent, model, count, opts ): model = any s3d object (its geometry, texture, color and baked AO are
+-- used; the model itself is not changed, hide or remove it if you only need the copies). opts: castShadow (shadow map
+-- mode only), cull, unlit. Instances start hidden (scale 0); place them with setInstance.
+-- The object itself stays at the origin: positions given to setInstance are world coordinates.
+-- Without GPU instancing (s3d.instancing == false) the same API makes count ordinary objects instead.
+local instMethods = {}
+
+local function quatFromEuler( rx, ry, rz )
+    -- same rotation as rotateTo( rx, ry, rz ) (degrees): q = qy * qx * qz, i.e. Z first, then X, then Y
+    local hx, hy, hz = math.rad( rx or 0 ) * 0.5, math.rad( ry or 0 ) * 0.5, math.rad( rz or 0 ) * 0.5
+    local sx, cx, sy, cy, sz, cz = math.sin( hx ), math.cos( hx ), math.sin( hy ), math.cos( hy ), math.sin( hz ), math.cos( hz )
+    -- qy * qx = ( cy sx, sy cx, -sy sx, cy cx )
+    local ax, ay, az, aw = cy * sx, sy * cx, -sy * sx, cy * cx
+    -- ( qy * qx ) * qz, qz = ( 0, 0, sz, cz )
+    return ax * cz + ay * sz, ay * cz - ax * sz, aw * sz + az * cz, aw * cz - az * sz
+end
+M.quatFromEuler = quatFromEuler
+
+-- what: 1 = position / scale, 2 = rotation, 4 = color (sum), nil = all; each attribute is one engine call
+local function writeInstance( target, i, d, what )
+    local ext = target.fillExtendedData
+    what = what or 7
+    if what % 2 == 1 then ext:setAttributeValue( i, "s3dInstPose", d[1], d[2], d[3], d[4] ) end
+    if what % 4 >= 2 then ext:setAttributeValue( i, "s3dInstRot", d[5], d[6], d[7], d[8] ) end
+    if what >= 4 then ext:setAttributeValue( i, "s3dInstColor", d[9], d[10], d[11], d[12] ) end
+end
+
+function instMethods:_copyInstancesTo( target )
+    target.fillExtendedData.instances = self.instanceCount
+    for i = 1, self.instanceCount do writeInstance( target, i, self._s3dInstData[i] ) end
+end
+
+local function instanceData( self, i )
+    if i < 1 or i > self.instanceCount then error( "s3d: instance " .. tostring( i ) .. " out of range (1.." .. self.instanceCount .. ")", 3 ) end
+    return self._s3dInstData[i]
+end
+
+local function flushInstance( self, i, d, what )
+    writeInstance( self, i, d, what )
+    if self._s3dCaster and what ~= 4 then writeInstance( self._s3dCaster, i, d, what ) end -- casters ignore color
+end
+
+-- position, rotation (degrees, like rotateTo) and uniform scale of instance i
+function instMethods:setInstance( i, x, y, z, rx, ry, rz, scale )
+    local d = instanceData( self, i )
+    d[1], d[2], d[3], d[4] = x or d[1], y or d[2], z or d[3], scale or ( d[4] ~= 0 and d[4] ) or 1
+    local what = 1
+    if rx or ry or rz then d[5], d[6], d[7], d[8] = quatFromEuler( rx, ry, rz ); what = 3 end
+    flushInstance( self, i, d, what )
+    return self
+end
+
+-- position, rotation quaternion (e.g. from a physics engine) and uniform scale of instance i
+function instMethods:setInstancePose( i, x, y, z, qx, qy, qz, qw, scale )
+    local d = instanceData( self, i )
+    d[1], d[2], d[3], d[4] = x, y, z, scale or ( d[4] ~= 0 and d[4] ) or 1
+    d[5], d[6], d[7], d[8] = qx or 0, qy or 0, qz or 0, qw or 1
+    flushInstance( self, i, d, 3 )
+    return self
+end
+
+-- color of instance i, multiplied with the model's texture and fill color (alpha 0 hides it)
+function instMethods:setInstanceColor( i, r, g, b, a )
+    local d = instanceData( self, i )
+    d[9], d[10], d[11], d[12] = r or 1, g or 1, b or 1, a or 1
+    flushInstance( self, i, d, 4 )
+    return self
+end
+
+function instMethods:getInstance( i )
+    local d = instanceData( self, i )
+    return d[1], d[2], d[3], d[4]
+end
+
+-- hide instance i (scale 0) without changing the others
+function instMethods:hideInstance( i )
+    local d = instanceData( self, i )
+    d[4] = 0
+    flushInstance( self, i, d, 1 )
+    return self
+end
+
+-- fallback without GPU instancing: one ordinary object per instance, same methods
+local fallbackMethods = {}
+function fallbackMethods:setInstance( i, x, y, z, rx, ry, rz, scale )
+    local o = self._s3dCopies[i]
+    if not o then error( "s3d: instance " .. tostring( i ) .. " out of range", 2 ) end
+    o.isVisible = true
+    o:moveTo( x or o.position3d[1], y or o.position3d[2], z or o.position3d[3] )
+    if rx or ry or rz then o:rotateTo( rx or 0, ry or 0, rz or 0 ) end
+    if scale then o:scaleTo( scale, scale, scale ) end
+    return self
+end
+function fallbackMethods:setInstancePose( i, x, y, z, qx, qy, qz, qw, scale )
+    local o = self._s3dCopies[i]
+    o.isVisible = true
+    o:setPose( x, y, z, qx, qy, qz, qw )
+    if scale then o:scaleTo( scale, scale, scale ) end
+    return self
+end
+function fallbackMethods:setInstanceColor( i, r, g, b, a )
+    local o = self._s3dCopies[i]
+    o:setFillColor( r or 1, g or 1, b or 1, a or 1 )
+    return self
+end
+function fallbackMethods:getInstance( i )
+    local o = self._s3dCopies[i]
+    return o.position3d[1], o.position3d[2], o.position3d[3], o.scale3d[1]
+end
+function fallbackMethods:hideInstance( i ) self._s3dCopies[i].isVisible = false; return self end
+
+local function copyBuilder( src )
+    local b = newBuilder()
+    for k = 1, #src.P do b.P[k] = src.P[k] end
+    for k = 1, #src.U do b.U[k] = src.U[k] end
+    for k = 1, #src.N do b.N[k] = src.N[k] end
+    return b
+end
+
+function M.newInstances( parent, model, count, opts )
+    M.init()
+    opts = opts or {}
+    if type( model ) ~= "table" or not model._s3dGeom then error( "s3d.newInstances: model must be an s3d object", 2 ) end
+    count = math.max( 1, math.floor( count or 1 ) )
+    local o = {
+        texture = model._s3dTexture, baseDir = model._s3dBaseDir, color = model._s3dColor,
+        cull = opts.cull, _hasDegenerate = true, _ao = model._s3dAO,
+    }
+
+    if not M.instancing then
+        -- one object per instance (same geometry and AO), hidden until placed
+        local group = display.newGroup()
+        if parent then parent:insert( group ) end
+        group._s3dCopies = {}
+        for i = 1, count do
+            o.effect = opts.unlit and M.EFFECT_UNLIT or M.EFFECT_LIT
+            local c = finalize( group, copyBuilder( model._s3dGeom ), o )
+            if opts.castShadow then c:castShadow( true ) end
+            c.isVisible = false
+            group._s3dCopies[i] = c
+        end
+        for k, f in pairs( fallbackMethods ) do group[k] = f end
+        group.instanceCount, group.instanced = count, false
+        return group
+    end
+
+    o._extension = INSTANCE_EXTENSION
+    o.effect = opts.unlit and M.EFFECT_UNLIT_INST or M.EFFECT_LIT_INST
+    local obj = finalize( parent, copyBuilder( model._s3dGeom ), o )
+    for k, f in pairs( instMethods ) do obj[k] = f end
+    obj._s3dInst = true
+    obj.instanceCount, obj.instanced = count, true
+    obj._s3dInstData = {}
+    obj.fillExtendedData.instances = count
+    for i = 1, count do
+        local d = { 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1 } -- scale 0: hidden until placed
+        obj._s3dInstData[i] = d
+        writeInstance( obj, i, d )
+    end
+    if opts.castShadow then obj:castShadow( true ) end
+    return obj
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Sprites: textured quads in the 3D scene that face the camera (billboards), with frame animation from an image sheet.
+-- s3d.newSprite( parent, filename, opts ): opts.width / height (world units, default 1 x 1 or the frame's aspect),
+-- anchorX / anchorY (0..1, Solar2D style: 0 = left / top; default 0.5, 1 = feet on the ground), billboard = "upright"
+-- (default: turns around Y only) | "full" (faces the camera completely) | false (a fixed quad facing +Z, use rotateTo),
+-- sheet (image sheet, see below), sequences, lit (false: unlit; true: lit and shadowed), castShadow (shadow map mode),
+-- color, baseDir. Pixels below 50% alpha are cut out, so sprites need no sorting.
+-- sheet: { columns = 8, rows = 4 } (a grid, frames numbered row by row) or Solar2D's graphics.newImageSheet options
+-- { frames = { { x, y, width, height }, ... }, sheetContentWidth = W, sheetContentHeight = H }.
+-- sequences: Solar2D style, { name = "walk", start = 1, count = 8, time = 800, loopCount = 0, loopDirection = "forward" }
+-- or { name = "idle", frames = { 9, 10, 9, 11 }, time = 600 }; loopCount 0 = forever, loopDirection "bounce" too.
+local spriteMethods = {}
+local playingSprites = setmetatable( {}, { __mode = "k" } )
+
+local function sheetFrames( sheet )
+    local frames = {}
+    if not sheet then
+        frames[1] = { 0, 0, 1, 1, 1 }
+        return frames
+    end
+    if sheet.frames then
+        local W, H = sheet.sheetContentWidth, sheet.sheetContentHeight
+        if not W or not H then error( "s3d.newSprite: sheet.frames needs sheetContentWidth and sheetContentHeight", 3 ) end
+        for i, f in ipairs( sheet.frames ) do
+            frames[i] = { f.x / W, f.y / H, ( f.x + f.width ) / W, ( f.y + f.height ) / H, f.width / f.height }
+        end
+    else
+        local cols, rows = sheet.columns or sheet.cols or 1, sheet.rows or 1
+        local n = sheet.count or sheet.numFrames or cols * rows
+        local aspect = sheet.aspect or 1
+        for i = 1, n do
+            local c, r = ( i - 1 ) % cols, math.floor( ( i - 1 ) / cols )
+            frames[i] = { c / cols, r / rows, ( c + 1 ) / cols, ( r + 1 ) / rows, aspect }
+        end
+    end
+    return frames
+end
+
+-- vertex order of the quad (see newSprite): top-left, bottom-left, bottom-right, top-left, bottom-right, top-right
+local QUAD_U = { 1, 1, 3, 1, 3, 3 }
+local QUAD_V = { 2, 4, 4, 2, 4, 2 }
+
+function spriteMethods:_applyUV( target )
+    local uv = self._s3dUV
+    local u0, v0, u1, v1 = uv[1], uv[2], uv[3], uv[4]
+    if self._s3dFlipX then u0, u1 = u1, u0 end
+    if self._s3dFlipY then v0, v1 = v1, v0 end
+    local q = { u0, v0, u1, v1 }
+    local path = ( target or self ).path
+    for i = 1, 6 do path:setUV( i, q[QUAD_U[i]], q[QUAD_V[i]] ) end
+end
+
+local function showFrame( self, index )
+    local f = self._s3dFrames[index]
+    if not f then error( "s3d: sprite frame " .. tostring( index ) .. " out of range (1.." .. #self._s3dFrames .. ")", 3 ) end
+    self._s3dUV = f
+    self:_applyUV()
+    if self._s3dCaster then self:_applyUV( self._s3dCaster ) end
+end
+
+-- show a frame of the image sheet directly (stops the animation)
+function spriteMethods:setSheetFrame( index )
+    self:pause()
+    showFrame( self, index )
+    self.sheetFrame = index
+    return self
+end
+
+function spriteMethods:setFlip( x, y )
+    self._s3dFlipX, self._s3dFlipY = x and true or false, y and true or false
+    self:_applyUV()
+    if self._s3dCaster then self:_applyUV( self._s3dCaster ) end
+    return self
+end
+
+local function seqFrame( seq, i ) return seq.frames and seq.frames[i] or ( seq.start + i - 1 ) end
+
+local function dispatch( self, phase )
+    if self.dispatchEvent then self:dispatchEvent{ name = "sprite", phase = phase, target = self, sequence = self.sequence, frame = self.frame } end
+end
+
+-- pick a sequence by name (shows its first frame, does not start playing)
+function spriteMethods:setSequence( name )
+    local seq = self._s3dSequences[name]
+    if not seq then error( "s3d: unknown sprite sequence '" .. tostring( name ) .. "'", 2 ) end
+    self._s3dSeq, self.sequence = seq, name
+    self.numFrames = seq.frames and #seq.frames or seq.count
+    self._s3dTime, self._s3dLoops, self._s3dDir = 0, 0, 1
+    self.frame = 1
+    self.sheetFrame = seqFrame( seq, 1 )
+    showFrame( self, self.sheetFrame )
+    return self
+end
+
+-- frame within the current sequence (1..numFrames)
+function spriteMethods:setFrame( i )
+    local seq = self._s3dSeq
+    i = math.max( 1, math.min( self.numFrames, math.floor( i ) ) )
+    self.frame = i
+    self._s3dTime = ( i - 1 ) * ( seq.time or 1000 ) / self.numFrames
+    self.sheetFrame = seqFrame( seq, i )
+    showFrame( self, self.sheetFrame )
+    return self
+end
+
+function spriteMethods:play()
+    if not self.isPlaying then
+        self.isPlaying = true
+        playingSprites[self] = true
+        dispatch( self, "began" )
+    end
+    return self
+end
+
+function spriteMethods:pause()
+    self.isPlaying = false
+    playingSprites[self] = nil
+    return self
+end
+
+-- advance one sprite by dt milliseconds
+local function stepSprite( self, dt )
+    local seq = self._s3dSeq
+    local n = self.numFrames
+    if not seq or n <= 1 then return end
+    local per = ( seq.time or ( n * 1000 / 15 ) ) / n -- default 15 frames per second
+    self._s3dTime = self._s3dTime + dt * ( self.timeScale or 1 )
+    local steps = math.floor( self._s3dTime / per )
+    if steps <= 0 then return end
+    self._s3dTime = self._s3dTime - steps * per
+    local bounce = seq.loopDirection == "bounce"
+    local loopCount = seq.loopCount or 0
+    for _ = 1, steps do
+        local nextFrame = self.frame + self._s3dDir
+        if nextFrame > n or nextFrame < 1 then
+            if bounce and self._s3dDir == 1 then
+                self._s3dDir = -1; nextFrame = n - 1
+            else
+                self._s3dLoops = self._s3dLoops + 1
+                if loopCount > 0 and self._s3dLoops >= loopCount then
+                    self:pause()
+                    dispatch( self, "ended" )
+                    return
+                end
+                if bounce then self._s3dDir = 1; nextFrame = 2 else nextFrame = 1 end
+                dispatch( self, "loop" )
+            end
+            nextFrame = math.max( 1, math.min( n, nextFrame ) )
+        end
+        self.frame = nextFrame
+    end
+    self.sheetFrame = seqFrame( seq, self.frame )
+    showFrame( self, self.sheetFrame )
+    dispatch( self, "next" )
+end
+
+local lastSpriteTime
+-- called every frame by s3d.init's enterFrame listener
+function M._stepSprites( time )
+    local dt = lastSpriteTime and ( time - lastSpriteTime ) or 0
+    lastSpriteTime = time
+    if dt <= 0 or dt > 250 then return end -- first frame, or after a pause (app suspended)
+    for spr in pairs( playingSprites ) do
+        if spr.removeSelf and spr.isVisible ~= nil then stepSprite( spr, dt ) else playingSprites[spr] = nil end
+    end
+end
+
+function M.newSprite( parent, filename, opts )
+    M.init()
+    opts = opts or {}
+    if type( filename ) ~= "string" then error( "s3d.newSprite: filename (the image) is required", 2 ) end
+    local frames = sheetFrames( opts.sheet )
+    local aspect = frames[1][5] or 1
+    local h = opts.height or ( opts.width and opts.width / aspect ) or 1
+    local w = opts.width or h * aspect
+    local ax, ay = opts.anchorX or 0.5, opts.anchorY or ( opts.billboard == false and 0.5 or 1 )
+    local xl, xr, yt, yb = -ax * w, ( 1 - ax ) * w, ay * h, -( 1 - ay ) * h
+
+    local b = newBuilder()
+    local f = frames[1]
+    b:vertex( xl, yt, 0, f[1], f[2], 0, 0, 1 ) -- top-left
+    b:vertex( xl, yb, 0, f[1], f[4], 0, 0, 1 ) -- bottom-left
+    b:vertex( xr, yb, 0, f[3], f[4], 0, 0, 1 ) -- bottom-right
+    b:vertex( xl, yt, 0, f[1], f[2], 0, 0, 1 ) -- top-left
+    b:vertex( xr, yb, 0, f[3], f[4], 0, 0, 1 ) -- bottom-right
+    b:vertex( xr, yt, 0, f[3], f[2], 0, 0, 1 ) -- top-right
+
+    local mode = opts.billboard
+    if mode == nil then mode = "upright" end
+    local bits = 0
+    if mode == "upright" then bits = 8192 + 16384 elseif mode == "full" or mode == true then bits = 8192 end
+
+    local o = { texture = filename, baseDir = opts.baseDir, color = opts.color, ao = false, cull = false,
+        effect = opts.lit and M.EFFECT_SPRITE_LIT or M.EFFECT_SPRITE, x = opts.x, y = opts.y, z = opts.z }
+    -- the billboard bits must be known when finalize sets the effect
+    local spr
+    o._preEffect = function( mesh ) mesh._s3dBillboard = bits ~= 0 and bits or nil end
+    spr = finalize( parent, b, o )
+    for k, fn in pairs( spriteMethods ) do spr[k] = fn end
+    spr._s3dFrames = frames
+    spr._s3dUV = frames[1]
+    spr.spriteWidth, spr.spriteHeight = w, h
+    spr._s3dSequences = {}
+    local seqs = opts.sequences or { { name = "default", start = 1, count = #frames } }
+    if seqs.name then seqs = { seqs } end
+    for _, q in ipairs( seqs ) do
+        local seq = {}
+        for k, v in pairs( q ) do seq[k] = v end
+        seq.start = seq.start or 1
+        seq.count = seq.count or ( seq.frames and #seq.frames ) or ( #frames - seq.start + 1 )
+        spr._s3dSequences[seq.name or "default"] = seq
+        if not spr.sequence then spr:setSequence( seq.name or "default" ) end
+    end
+    if opts.castShadow then spr:castShadow( true ) end
+    if opts.play ~= false and spr.numFrames > 1 and opts.sequences then spr:play() end
+    return spr
+end
+
 -- ---------------------------------------------------------------------------
 -- OBJ (Wavefront): v, vt, vn, f (polygons -> triangle fans). Materials are ignored.
 -- Opens an OBJ file; also tries the name + ".txt" (Solar2D for Android always drops "*.obj" from the APK: the exclusion list
@@ -1233,6 +1697,325 @@ function M.loadOBJ( parent, filename, opts )
     opts = opts or {}
     opts._aoKey = tostring( filename ) .. "|" .. tostring( opts.scale or 1 )
     return finalize( parent, parseOBJ( filename, opts, 2 ), opts )
+end
+
+---------------------------------------------------------------------------------------------
+-- glTF 2.0 (.glb, or .gltf with embedded data) through cgltf. Static models: the rest pose of every mesh node is baked
+-- into one Solar2D mesh per material. Embedded images are written to the temporary directory and used as textures.
+--
+--   local golem = s3d.loadGLTF( scene, "assets/glbs/cinderheart_golem.glb", {
+--       height = 2,            -- scale so the model is this tall (or scale = 0.5)
+--       center = true,         -- put the model's feet at y = 0, centred on x / z (default true)
+--       castShadow = true, unlit = false, x = 0, y = 0, z = 0,
+--   } )
+--   golem:moveTo( 3, 0, 0 ); golem:rotateTo( 0, 45, 0 ); golem:scaleTo( 1.5 )
+--   golem.parts, golem.animations (names; playback comes later), golem.width3d, golem.height3d, golem.depth3d
+---------------------------------------------------------------------------------------------
+local gltfCache = {}    -- path -> parsed model (the arrays are copied for every load: finalize appends to them)
+local gltfImages = {}   -- path .. "#" .. i -> file name in the temporary directory
+
+local function gltfRead( filename, baseDir, level )
+    local path = system.pathForFile( filename, baseDir )
+    local f = path and io.open( path, "rb" )
+    if not f then error( "s3d.loadGLTF: cannot open " .. tostring( filename ), level + 1 ) end
+    local bytes = f:read( "*a" )
+    f:close()
+    return path, bytes
+end
+
+-- -> file name, baseDir of the texture. Embedded images (GLB buffer views, data: URIs) are written once to the
+-- temporary directory; an external image (uri) is used where it is, relative to the glTF file, in the same baseDir.
+local function gltfImage( key, img, filename, baseDir )
+    if img.uri then
+        local uri = img.uri:gsub( "%%(%x%x)", function( h ) return string.char( tonumber( h, 16 ) ) end ):gsub( "\\", "/" )
+        local dir = filename:match( "^(.*[/\\])" ) or ""
+        return dir:gsub( "\\", "/" ) .. uri, baseDir
+    end
+    local name = gltfImages[key]
+    if name then return name, system.TemporaryDirectory end
+    if not img.data then return nil end
+    local ext = img.mime == "image/jpeg" and ".jpg" or ".png"
+    local n = 0
+    for _ in pairs( gltfImages ) do n = n + 1 end
+    name = "s3d_gltf_" .. ( n + 1 ) .. "_" .. ( key:match( "([%w_%-]+)%.%w+#" ) or "img" ) .. ext
+    local f = io.open( system.pathForFile( name, system.TemporaryDirectory ), "wb" )
+    if not f then return nil end
+    f:write( img.data )
+    f:close()
+    gltfImages[key] = name
+    return name, system.TemporaryDirectory
+end
+
+-- glTF BLEND parts go into one group per parent, kept after the opaque objects (they do not write depth, so anything
+-- drawn after them that is further away would cover them)
+local function blendLayer( parent )
+    if not parent then return nil end
+    local layer = parent._s3dBlendLayer
+    if layer then return layer end
+    layer = display.newGroup()
+    parent:insert( layer )
+    parent._s3dBlendLayer = layer
+    if parent._s3dShadowLayer then parent._s3dShadowLayer:toFront() end
+    return layer
+end
+
+local function copyArray( a )
+    local c = {}
+    for i = 1, #a do c[i] = a[i] end
+    return c
+end
+
+local modelMethods = {}
+local function forward( name )
+    modelMethods[name] = function( self, ... )
+        for i = 1, #self.parts do local p = self.parts[i]; p[name]( p, ... ) end
+        return self
+    end
+end
+for _, name in ipairs{ "moveTo", "moveBy", "rotateTo", "rotateBy", "setPose", "setRotationQuat", "scaleTo",
+    "setCulling", "setDepthTest", "setReflection" } do forward( name ) end
+
+-- ---- node animation (glTF step 2): the rig (C) poses every part's vertices into buffers the parts use as morph source
+local playingModels = setmetatable( {}, { __mode = "k" } )
+local lastModelTime
+
+local function applyMorph( part )
+    local mo = part._s3dMorph
+    if not mo then return end
+    local function put( o ) if o and o.fill and o.fill.effect then o.fill.effect.s3dMorph = mo end end
+    put( part ); put( part._s3dCaster ); put( part._s3dShadow )
+end
+
+local function poseModel( self )
+    local a = self._anim
+    if not a then return end
+    if a.fadeTo then
+        C.gltfPose( self._rig, a.clip, a.time, a.fadeTo.clip, a.fadeTo.time, a.fadeTo.weight )
+    else
+        C.gltfPose( self._rig, a.clip, a.time )
+    end
+    for i = 1, #self.parts do applyMorph( self.parts[i] ) end
+end
+
+local function ensureRig( self )
+    if self._rigReady then return true end
+    if not self._rig then return false end
+    for _, part in ipairs( self.parts ) do
+        local outP, outN = C.gltfAttach( self._rig, part._s3dGroup )
+        part._s3dMorph = { outP, outP, 0, outN, outN }
+    end
+    self._rigReady = true
+    return true
+end
+
+local function clipIndex( self, name )
+    if type( name ) == "number" then return self.animations[name] and name or nil end
+    for i, n in ipairs( self.animations ) do if n == name then return i end end
+    return nil
+end
+
+local function advance( self, st, dt, isMain )
+    local dur = self._durations[st.clip] or 0
+    st.time = st.time + dt * st.speed
+    if dur <= 0 then st.time = 0; return false end
+    if st.loop then
+        st.time = st.time % dur
+    elseif st.time >= dur then
+        st.time = dur
+        return isMain -- finished
+    elseif st.time < 0 then
+        st.time = 0
+    end
+    return false
+end
+
+local function stepModel( self, dt )
+    local a = self._anim
+    if not a or self._paused then return end
+    local s = dt * 0.001 * ( self.timeScale or 1 )
+    local finished = false
+    if a.fadeTo then
+        local f = a.fadeTo
+        advance( self, a, s, false )
+        finished = advance( self, f, s, true )
+        f.weight = f.weight + s / f.fade
+        if f.weight >= 1 then
+            a.clip, a.time, a.loop, a.speed, a.onComplete = f.clip, f.time, f.loop, f.speed, f.onComplete
+            a.fadeTo = nil
+        end
+    else
+        finished = advance( self, a, s, true )
+    end
+    if self.isVisible ~= false then poseModel( self ) end
+    self.animation, self.animationTime = self.animations[a.fadeTo and a.fadeTo.clip or a.clip], ( a.fadeTo or a ).time
+    if finished then
+        playingModels[self] = nil
+        local cb = ( a.fadeTo or a ).onComplete
+        if cb then cb( self, self.animation ) end
+    end
+end
+
+function M._stepModels( time )
+    local dt = lastModelTime and ( time - lastModelTime ) or 0
+    lastModelTime = time
+    if dt <= 0 or dt > 250 then return end
+    for model in pairs( playingModels ) do
+        if model.parts[1] and model.parts[1].removeSelf then stepModel( model, dt ) else playingModels[model] = nil end
+    end
+end
+
+-- model:play( name or index, { loop = true, speed = 1, fade = 0.2 (seconds, cross-fade from the current clip),
+--                              time = 0, onComplete = function( model, name ) end } )
+function modelMethods:play( name, opts )
+    opts = opts or {}
+    local clip = clipIndex( self, name or 1 )
+    if not clip then error( "s3d: model has no animation " .. tostring( name ), 2 ) end
+    if not ensureRig( self ) then return self end
+    local st = { clip = clip, time = opts.time or 0, loop = opts.loop ~= false, speed = opts.speed or 1, onComplete = opts.onComplete }
+    local a = self._anim
+    local fade = opts.fade or 0.2
+    if a and fade > 0 and playingModels[self] and not self._paused then
+        if a.fadeTo then -- already fading: the clip being faded in becomes the base
+            local f = a.fadeTo
+            if f.weight >= 0.5 then a.clip, a.time, a.loop, a.speed = f.clip, f.time, f.loop, f.speed end
+        end
+        st.fade, st.weight = fade, 0
+        a.fadeTo = st
+    else
+        self._anim = st
+    end
+    self._paused = false
+    playingModels[self] = true
+    self.animation, self.animationTime = self.animations[clip], st.time
+    poseModel( self )
+    return self
+end
+function modelMethods:pause() self._paused = true; return self end
+function modelMethods:resume() if self._anim then self._paused = false; playingModels[self] = true end; return self end
+function modelMethods:isPlaying() return playingModels[self] ~= nil and not self._paused end
+function modelMethods:setSpeed( s ) self.timeScale = s; return self end
+-- jump to a time (seconds) of the current clip, also while paused
+function modelMethods:setTime( t )
+    local a = self._anim
+    if not a then return self end
+    a.fadeTo = nil
+    a.time = t
+    self.animationTime = t
+    poseModel( self )
+    return self
+end
+-- back to the rest pose (the file's bind pose, as loaded)
+function modelMethods:stop()
+    playingModels[self] = nil
+    self._anim, self._paused, self.animation = nil, false, nil
+    if self._rigReady then
+        C.gltfPose( self._rig, 0, 0 )
+        for i = 1, #self.parts do applyMorph( self.parts[i] ) end
+    end
+    return self
+end
+function modelMethods:getDuration( name )
+    local i = clipIndex( self, name or ( self._anim and self._anim.clip ) or 1 )
+    return i and self._durations[i] or 0
+end
+function modelMethods:castShadow( on )
+    for i = 1, #self.parts do local p = self.parts[i]; p:castShadow( on ); applyMorph( p ) end
+    return self
+end
+function modelMethods:setVisible( on ) for i = 1, #self.parts do self.parts[i].isVisible = on end; self.isVisible = on; return self end
+function modelMethods:setFillColor( ... ) for i = 1, #self.parts do self.parts[i]:setFillColor( ... ) end; return self end
+function modelMethods:removeSelf()
+    playingModels[self] = nil
+    for i = 1, #self.parts do display.remove( self.parts[i] ) end
+    self.parts = {}
+end
+
+function M.loadGLTF( parent, filename, opts )
+    M.init()
+    opts = opts or {}
+    local baseDir = opts.baseDir or system.ResourceDirectory
+    local path = system.pathForFile( filename, baseDir ) or filename
+    local data = gltfCache[path]
+    if data and data.static and not opts.static then data = nil end -- cached without its animations
+    if not data then
+        local _, bytes = gltfRead( filename, baseDir, 2 )
+        local ok, res = pcall( C.gltfLoad, bytes, opts.static )
+        if not ok then error( tostring( res ) .. " (" .. tostring( filename ) .. ")", 2 ) end
+        data = res
+        if opts.static then data.static = true end
+        gltfCache[path] = data
+    end
+
+    local bb = data.bounds
+    local scale = opts.scale or 1
+    if opts.height and bb[5] > bb[2] then scale = opts.height / ( bb[5] - bb[2] ) end
+    local ox, oy, oz = 0, 0, 0
+    if opts.center ~= false then ox, oy, oz = ( bb[1] + bb[4] ) * 0.5, bb[2], ( bb[3] + bb[6] ) * 0.5 end
+
+    local model = { parts = {}, animations = data.animations, isVisible = true, filename = filename,
+        width3d = ( bb[4] - bb[1] ) * scale, height3d = ( bb[5] - bb[2] ) * scale, depth3d = ( bb[6] - bb[3] ) * scale }
+    for k, f in pairs( modelMethods ) do model[k] = f end
+    if data.rig and not opts.static then
+        model._rig = C.gltfCloneRig( data.rig )
+        model._durations = C.gltfDurations( model._rig )
+        C.gltfSetOrigin( model._rig, ox, oy, oz, scale )
+    else
+        model._durations = {}
+    end
+
+    -- opaque parts first, blended ones last (drawn over what is behind them)
+    local order = {}
+    for gi, g in ipairs( data.groups ) do
+        local mat = data.materials[g.material] or {}
+        order[#order + 1] = { g = g, mat = mat, blend = mat.alphaMode == "BLEND" and 1 or 0, i = gi }
+    end
+    table.sort( order, function( a, b ) if a.blend ~= b.blend then return a.blend < b.blend end return a.i < b.i end )
+
+    for _, e in ipairs( order ) do
+        local g, mat = e.g, e.mat
+        local b = newBuilder()
+        local P = copyArray( g.P )
+        for i = 1, #P, 3 do
+            P[i] = ( P[i] - ox ) * scale; P[i + 1] = ( P[i + 1] - oy ) * scale; P[i + 2] = ( P[i + 2] - oz ) * scale
+        end
+        b.P, b.U, b.N = P, copyArray( g.U ), copyArray( g.N )
+
+        local tex, texDir
+        if mat.image and data.images[mat.image] then
+            tex, texDir = gltfImage( path .. "#" .. mat.image, data.images[mat.image], filename, baseDir )
+        end
+        local mask = mat.alphaMode == "MASK"
+        local col = mat.color or { 1, 1, 1, 1 }
+        local o = {
+            texture = tex, baseDir = tex and texDir or nil,
+            color = ( col[1] ~= 1 or col[2] ~= 1 or col[3] ~= 1 or col[4] ~= 1 ) and { col[1], col[2], col[3], col[4] } or nil,
+            -- BLEND keeps back faces culled even when double-sided: without sorting, the far side of a see-through box
+            -- would be blended over its near side (Blockbench marks every material double-sided)
+            cull = ( e.blend == 1 or not mat.doubleSided ) and opts.cull ~= false,
+            effect = opts.effect or ( mask and ( opts.unlit and M.EFFECT_SPRITE or M.EFFECT_SPRITE_LIT ) ) or ( opts.unlit and M.EFFECT_UNLIT or M.EFFECT_LIT ),
+            ao = opts.ao, aoDistance = opts.aoDistance, _aoKey = path .. "|" .. e.i .. "|" .. scale,
+        }
+        if o.cull == true then o.cull = nil end
+        o._preEffect = function( mesh ) if mask and tex then mesh._s3dAlphaCut = true end end
+
+        -- pixel-art textures (Blockbench): nearest filtering, as the file's sampler asks
+        local mag, minf
+        if tex and mat.nearest then
+            mag, minf = display.getDefault( "magTextureFilter" ), display.getDefault( "minTextureFilter" )
+            display.setDefault( "magTextureFilter", "nearest" ); display.setDefault( "minTextureFilter", "nearest" )
+        end
+        local part = finalize( e.blend == 1 and blendLayer( parent ) or parent, b, o )
+        if mag then display.setDefault( "magTextureFilter", mag ); display.setDefault( "minTextureFilter", minf ) end
+        if e.blend == 1 then part:setDepthWrite( false ); part._s3dBlend = true end
+        part._s3dMaterial = mat.name
+        part._s3dGroup = e.i
+        model.parts[#model.parts + 1] = part
+    end
+
+    if opts.castShadow then model:castShadow( true ) end
+    if opts.x or opts.y or opts.z then model:moveTo( opts.x or 0, opts.y or 0, opts.z or 0 ) end
+    if opts.animation and model._rig then model:play( opts.animation, { fade = 0, loop = opts.loop, speed = opts.speed } ) end
+    return model
 end
 
 ---------------------------------------------------------------------------------------------

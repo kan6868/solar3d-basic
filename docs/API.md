@@ -1,6 +1,6 @@
 # plugin.s3d API reference
 
-Version 0.8.0.
+Version 0.12.0.
 
 ```lua
 local s3d = require( "plugin.s3d" )
@@ -13,6 +13,8 @@ local s3d = require( "plugin.s3d" )
 - [Object methods](#object-methods): transform, render state, shadows, effects, reflections
 - [Frame animation](#frame-animation): `loadOBJAnimation` and its methods
 - [Dynamic meshes](#dynamic-meshes): `newMesh`, `newGrid` and their methods
+- [Instances](#instances): `newInstances`, many copies of a model in one draw call
+- [Sprites](#sprites): `newSprite`, camera-facing images and image-sheet animation
 - [Camera](#camera): `setCamera`, `getCamera`, `orbit`
 - [Light](#light): `setLight`
 - [Fog](#fog): `setFog`
@@ -43,8 +45,9 @@ local s3d = require( "plugin.s3d" )
 | `s3d.supported` | `false` on the Vulkan backend. 3D objects are then created hidden and a warning is printed. |
 | `s3d.isSupported()` | Returns `s3d.supported`. |
 | `s3d.isMobile` | `true` on Android, iOS and tvOS. Handy for picking shadow quality. |
+| `s3d.instancing` | `true` when GPU instancing is available (set by `init`; currently Windows only, `false` on Android). See [Instances](#instances). |
 | `s3d.init()` | Registers the effects and render hooks. Called automatically; calling it again does nothing. Enables `display.setDefault( "enableDepth", true )`. |
-| `s3d.EFFECT_LIT`, `EFFECT_UNLIT`, `EFFECT_NORMALS`, `EFFECT_SHADOW`, `EFFECT_DEPTH`, `EFFECT_POST` | Effect names (`"filter.s3d.lit"`, ...). See [Effects](#effects). |
+| `s3d.EFFECT_LIT`, `EFFECT_UNLIT`, `EFFECT_REFLECT`, `EFFECT_SKY`, `EFFECT_SPRITE`, `EFFECT_SPRITE_LIT`, `EFFECT_DEPTH_SPRITE`, `EFFECT_LIT_INST`, `EFFECT_UNLIT_INST`, `EFFECT_DEPTH_INST`, `EFFECT_NORMALS`, `EFFECT_SHADOW`, `EFFECT_DEPTH`, `EFFECT_POST` | Effect names (`"filter.s3d.lit"`, ...). See [Effects](#effects). |
 
 ## Scenes
 
@@ -146,6 +149,69 @@ normals; materials (`mtllib`, `usemtl`) and groups are ignored. Extra option: `s
 Solar2D for Android always drops `*.obj` files from the APK. Name your models `model.obj.txt`; when a name ends in
 `.obj`, `loadOBJ` also tries the same name with `.txt` appended, so `s3d.loadOBJ( scene, "model.obj" )` works on every
 platform.
+
+### glTF files
+
+```lua
+local golem = s3d.loadGLTF( scene, "assets/glbs/golem.glb", { height = 2, castShadow = true, x = 3 } )
+golem:moveTo( 0, 0, -4 ):rotateTo( 0, 45, 0 )
+print( golem.height3d, #golem.parts, table.concat( golem.animations, ", " ) )
+```
+
+`s3d.loadGLTF( parent, filename, [opts] )` loads a glTF 2.0 model through [cgltf](https://github.com/jkuhlmann/cgltf).
+Use `.glb` files, or `.gltf` files whose buffers are embedded (`data:` URIs); separate `.bin` files are not read.
+Images may be embedded (GLB, `data:` URIs) or **external files** (`"uri": "Textures/colormap.png"`): an external image
+is loaded relative to the glTF file, from the same `baseDir` (e.g. Kenney kits exported from Unity share one
+`Textures/colormap.png`). `KHR_texture_transform` is ignored (only its default, identity, is supported).
+
+What is loaded:
+
+- every node with a mesh, in its **rest pose** (the node hierarchy's transforms are baked into the vertices);
+- triangle primitives with `POSITION`, `NORMAL` (flat normals when missing) and `TEXCOORD_0`;
+- one Solar2D mesh per material (`model.parts`), opaque parts first;
+- the base colour texture (embedded PNG / JPEG, written once to `system.TemporaryDirectory`) and `baseColorFactor`;
+- `alphaMode`: `MASK` uses an alpha cut-out (`filter.s3d.spritelit`, threshold 0.5) and cut-out shadows, `BLEND`
+  parts are drawn without depth writes, with back faces culled (even when double-sided) and without shadows, in a
+  group kept after the parent's other s3d objects; `doubleSided` turns culling off for the other modes;
+- a `NEAREST` sampler (Blockbench pixel art) gives nearest texture filtering.
+
+- node animations (translation, rotation, scale; linear, step and cubic-spline keys): see below.
+
+Not yet: skins, morph targets, normal / metallic-roughness / emissive maps, cameras and lights. Sparse accessors are read; KHR extensions are ignored.
+
+Options: `scale` (or `height`: scale so the model is this tall), `center` (default `true`: the bounding box's bottom
+centre goes to the origin; `false` keeps the file's origin), `castShadow`, `unlit`, `effect`, `cull`, `ao`,
+`aoDistance`, `baseDir`, `x`, `y`, `z`. A file is parsed once and cached; later loads only copy the arrays.
+
+The returned model is a table (not a display object): `moveTo`, `moveBy`, `rotateTo`, `rotateBy`, `setPose`,
+`setRotationQuat`, `scaleTo`, `castShadow`, `setCulling`, `setDepthTest`, `setReflection`, `setFillColor`,
+`setVisible( on )` and `removeSelf()` apply to every part. Fields: `parts`, `animations`, `filename`, `width3d`,
+`height3d`, `depth3d` (size after scaling).
+
+#### Animation
+
+```lua
+local yeti = s3d.loadGLTF( scene, "assets/glbs/yeti.glb", { height = 2, animation = "idle" } )
+yeti:play( "walk", { fade = 0.25 } )                                     -- cross-fade from the current clip
+yeti:play( "attack_1", { loop = false, onComplete = function( model, name ) model:play( "idle" ) end } )
+```
+
+Blockbench-style animations move whole nodes (rigid parts). Every frame the plugin samples the clip's channels, builds
+the nodes' world matrices and transforms each part's vertices in C (about 0.02–0.08 ms per model on a desktop for
+2 000–9 000 vertices); the parts stay one draw call per material. Shadow casters follow the animation.
+
+- `model:play( name | index, [opts] )`: `loop` (default `true`), `speed` (default 1), `fade` (seconds, default 0.2:
+  cross-fade from the clip that is playing; 0 = switch at once), `time` (start time), `onComplete( model, name )`
+  (a non-looping clip reached its end; the last frame stays).
+- `model:pause()`, `model:resume()`, `model:isPlaying()`, `model:setSpeed( s )` (multiplies every clip's speed),
+  `model:setTime( seconds )` (also while paused), `model:stop()` (back to the rest pose),
+  `model:getDuration( [name] )`.
+- Fields: `model.animation` (current clip name), `model.animationTime` (seconds).
+- Load options: `animation` (play this clip at once), `loop`, `speed`; `static = true` skips the animation data (less
+  memory, no `play`).
+
+Each loaded copy has its own pose; the file is parsed once. Invisible models (`setVisible( false )`) keep their clock
+running but are not posed. Ambient occlusion (when enabled) is baked for the rest pose.
 
 ## Object methods
 
@@ -342,6 +408,111 @@ end )
 
 Memory: about 24 bytes per vertex and 84 bytes per triangle in C, plus the display object and its Lua vertex tables.
 
+## Sprites
+
+### `s3d.newSprite( parent, filename, [opts] )`
+
+An image in the 3D scene, on a quad that faces the camera (a billboard): trees, grass, characters and items in
+2.5D style, smoke and fire, markers. Pixels below 50% alpha are cut out, so sprites write depth and need no sorting.
+The quad is turned towards the camera in C every frame; it is still an ordinary s3d object (`moveTo`, `scaleTo`,
+`setFillColor`, `isVisible`, `castShadow`...).
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `width`, `height` | `1` high, width from the frame's aspect | Size in world units. |
+| `anchorX`, `anchorY` | `0.5`, `1` | Point of the image placed at the sprite's position (Solar2D style: 0 = left / top). The default puts the bottom on the ground. `0.5` for things floating in the air. |
+| `billboard` | `"upright"` | `"upright"`: turns around Y only, stays vertical (trees, characters). `"full"`: always faces the camera (particles, coins, markers). `false`: a fixed quad facing +Z, turned with `rotateTo` (signs, decals on walls). |
+| `sheet` | single image | Image sheet: a grid `{ columns = 8, rows = 4, [count], [aspect] }` (frames numbered row by row; `aspect` = frame width / height in pixels, default 1), or the options of `graphics.newImageSheet`: `{ frames = { { x, y, width, height }, ... }, sheetContentWidth, sheetContentHeight }` (TexturePacker data works as is). |
+| `sequences` | all frames | Solar2D style: `{ name = "walk", start = 1, count = 8, time = 800, loopCount = 0, loopDirection = "forward" }` or `{ name = "idle", frames = { 9, 10, 11 }, time = 600 }`. One table or a list. `loopCount` 0 = forever; `loopDirection` `"bounce"` plays forward then backward. Without `time`: 15 frames per second. |
+| `play` | `true` when `sequences` is given | Start the first sequence right away. |
+| `lit` | `false` | `true`: lit like `filter.s3d.lit` (sun, ambient, shadows on the sprite), the normal facing the camera. |
+| `castShadow` | `false` | Shadow with the image's outline, in shadow map mode only. The shadow is cast by the quad as it faces the camera. |
+| `color`, `baseDir`, `x`, `y`, `z` | | As for other objects. |
+
+```lua
+local tree = s3d.newSprite( scene, "tree.png", { height = 3, x = 4, z = -2, castShadow = true } )
+
+local hero = s3d.newSprite( scene, "hero.png", { height = 1.6, sheet = { columns = 8, rows = 2 },
+    sequences = {
+        { name = "walk", start = 1, count = 8, time = 800 },
+        { name = "jump", start = 9, count = 6, time = 500, loopCount = 1 },
+    } } )
+hero:moveTo( 0, 0, 3 )
+hero:setFlip( true )            -- walking to the left
+hero:setSequence( "jump" ); hero:play()
+hero:addEventListener( "sprite", function( e ) if e.phase == "ended" then hero:setSequence( "walk" ); hero:play() end end )
+```
+
+| Method / field | Description |
+| --- | --- |
+| `spr:setSequence( name )` | Pick a sequence; shows its first frame (call `play()` to start it). |
+| `spr:play()`, `spr:pause()` | Start / stop the animation. |
+| `spr:setFrame( i )` | Frame `i` of the current sequence. |
+| `spr:setSheetFrame( i )` | Frame `i` of the image sheet, outside any sequence (pauses). |
+| `spr:setFlip( x, y )` | Mirror the image horizontally / vertically. |
+| `spr.sequence`, `spr.frame`, `spr.numFrames`, `spr.sheetFrame`, `spr.isPlaying` | Current state. |
+| `spr.timeScale` | Playback speed multiplier (default 1). |
+| `spr.spriteWidth`, `spr.spriteHeight` | Size in world units. |
+| `"sprite"` event | `phase` = `"began"`, `"next"`, `"loop"`, `"ended"`, with `target`, `sequence`, `frame`, like Solar2D sprites. |
+
+Each sprite is one draw call; animation updates 6 UVs when the frame changes. For hundreds of identical static sprites
+(a forest), a model drawn with `newInstances` is cheaper. Planar shadows are not available for sprites.
+
+## Instances
+
+### `s3d.newInstances( parent, model, count, [opts] )`
+
+> **Platform support: GPU instancing currently works on Windows (win32 Simulator / desktop) only.** On Android,
+> Solar2D reports no instancing (`system.getInfo( "instancingSupport" )` is `false`), so `newInstances` falls back to
+> ordinary objects there (see **Fallback** below). Solar2D creates an OpenGL ES 2.0 context and only looks for the
+> ES 2 extensions (`GL_EXT_instanced_arrays`, `GL_ANGLE_instanced_arrays`, `GL_EXT_draw_instanced`), which current
+> ES 3.x drivers usually do not list, because instancing is core in ES 3.0 (`GLGeometry::SupportsInstancing`,
+> `librtt/Renderer/Rtt_GLGeometry.cpp`). Supporting Android needs an engine change, not a plugin change.
+
+Draws `count` copies of a model with **GPU instancing**: one mesh, one draw call, and each copy's position, rotation,
+scale and color applied in the vertex shader. For forests, rocks, fences, crowds, particles: 10,000 cubes cost one
+draw call instead of 10,000, and the CPU transforms the model's vertices once instead of once per copy.
+
+- `model`: any s3d object (`newCube`, `loadOBJ`, ...). Its geometry, texture, fill color and baked ambient occlusion
+  are used; the model itself is left as it is (make it outside the scene, or hide it).
+- `opts.castShadow`: copies cast shadows in shadow map mode (`setShadowMap`). Planar shadows are not available.
+- `opts.cull`, `opts.unlit`: as for other objects.
+- Copies start hidden (scale 0) and white; place them with `setInstance`.
+- The object itself stays at the origin: positions are world coordinates. Do not `moveTo` / `rotateTo` it.
+
+```lua
+local tree = s3d.loadOBJ( nil, "tree.obj.txt", { texture = "colormap.png" } )
+tree.isVisible = false
+local forest = s3d.newInstances( scene, tree, 2000, { castShadow = true } )
+for i = 1, 2000 do
+    forest:setInstance( i, math.random( -50, 50 ), 0, math.random( -50, 50 ), 0, math.random( 360 ), 0, 0.8 + math.random() * 0.4 )
+end
+```
+
+| Method / field | Description |
+| --- | --- |
+| `inst:setInstance( i, x, y, z, [rx, ry, rz], [scale] )` | Position, rotation (degrees, same order as `rotateTo`) and uniform scale of copy `i` (1-based). Leaving out the rotation keeps it; leaving out the scale keeps it (1 for a hidden copy). |
+| `inst:setInstancePose( i, x, y, z, qx, qy, qz, qw, [scale] )` | Same with a quaternion (physics engines). |
+| `inst:setInstanceColor( i, r, g, b, [a] )` | Multiplies the model's texture and fill color. |
+| `inst:getInstance( i )` | Returns `x, y, z, scale`. |
+| `inst:hideInstance( i )` | Hides copy `i` (scale 0). |
+| `inst.instanceCount` | Number of copies. |
+| `inst.instanced` | `true` with GPU instancing, `false` for the fallback below. |
+| `s3d.quatFromEuler( rx, ry, rz )` | Quaternion of the same rotation as `rotateTo( rx, ry, rz )`. |
+
+**Cost of updates.** Each call writes the copy's data through Solar2D's vertex extension API (one call for the
+position, one more if the rotation changes, one for the color). That is fine for copies placed once, or a few hundred
+moving every frame; moving thousands every frame costs several milliseconds of Lua per frame on a desktop and more on
+phones (Solar2D cannot write instance data from C yet).
+
+**Fallback.** `s3d.instancing` is `false` when `system.getInfo( "instancingSupport" )` reports no instancing (Android,
+see the note above) or on the Vulkan backend. `newInstances` then makes `count` ordinary objects in a group, with the
+same methods: the code keeps working, only slower.
+
+**Limits.** No culling per copy (all of them are drawn); one texture and effect per instance object; no planar
+shadows. Effects: `filter.s3d.litinst`, `unlitinst`, `depthinst` (vertex extension `s3dInst`: attributes
+`s3dInstPose` = x, y, z, scale; `s3dInstRot` = quaternion; `s3dInstColor`).
+
 ## Camera
 
 ### `s3d.setCamera( opts )`
@@ -516,6 +687,8 @@ end )
 | `filter.s3d.unlit` | Texture and fill color only, plus fog. Good for skies, glowing objects, the demo's sun. |
 | `filter.s3d.reflect` | `lit` plus an environment reflection; set by `setReflection` (needs a composite paint). |
 | `filter.s3d.sky` | Texture and fill color only, no fog. Used by `newSky`. |
+| `filter.s3d.sprite`, `spritelit`, `depthsprite` | Sprites (`newSprite`): unlit / lit with 50% alpha cut-out, and their shadow-pass version. |
+| `filter.s3d.litinst`, `unlitinst`, `depthinst` | `lit`, `unlit` and shadow-pass `depth` for `newInstances` (vertex extension `s3dInst`). |
 | `filter.s3d.normals` | Shows normals as colors, for debugging. |
 | `filter.s3d.shadow` | Used internally for planar shadows. |
 | `filter.s3d.depth` | Used internally for the shadow map pass. |

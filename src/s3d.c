@@ -30,7 +30,7 @@
 #include "lauxlib.h"
 #include "s3d_corona.h"
 
-#define S3D_VERSION "0.8.0"
+#define S3D_VERSION "0.12.0"
 
 /* ========================================================================== */
 /* Function binding: resolved at run time on Windows, linked directly on Android            */
@@ -171,6 +171,7 @@ static glUseProgram_t p_glUseProgram;
     X( void, lua_pushnil, ( lua_State * L ), ( L ) ) \
     X( void, lua_pushnumber, ( lua_State * L, lua_Number n ), ( L, n ) ) \
     X( void, lua_pushstring, ( lua_State * L, const char * s ), ( L, s ) ) \
+    X( void, lua_pushlstring, ( lua_State * L, const char * s, size_t n ), ( L, s, n ) ) \
     X( void, lua_pushboolean, ( lua_State * L, int b ), ( L, b ) ) \
     X( void, lua_pushcclosure, ( lua_State * L, lua_CFunction f, int n ), ( L, f, n ) ) \
     X( void, lua_createtable, ( lua_State * L, int a, int b ), ( L, a, b ) ) \
@@ -178,6 +179,7 @@ static glUseProgram_t p_glUseProgram;
     X( void, lua_getfield, ( lua_State * L, int i, const char * k ), ( L, i, k ) ) \
     X( void, lua_setfield, ( lua_State * L, int i, const char * k ), ( L, i, k ) ) \
     X( void, lua_rawgeti, ( lua_State * L, int i, int n ), ( L, i, n ) ) \
+    X( void, lua_rawseti, ( lua_State * L, int i, int n ), ( L, i, n ) ) \
     X( void, lua_call, ( lua_State * L, int a, int r ), ( L, a, r ) ) \
     X( int, lua_error, ( lua_State * L ), ( L ) ) \
     X( int, luaL_loadbuffer, ( lua_State * L, const char * b, size_t sz, const char * name ), ( L, b, sz, name ) )
@@ -200,6 +202,7 @@ void * lua_touserdata( lua_State * L, int i ) { return p_lua_touserdata( L, i );
 void lua_pushnil( lua_State * L ) { p_lua_pushnil( L ); }
 void lua_pushnumber( lua_State * L, lua_Number n ) { p_lua_pushnumber( L, n ); }
 void lua_pushstring( lua_State * L, const char * s ) { p_lua_pushstring( L, s ); }
+void lua_pushlstring( lua_State * L, const char * s, size_t n ) { p_lua_pushlstring( L, s, n ); }
 void lua_pushboolean( lua_State * L, int b ) { p_lua_pushboolean( L, b ); }
 void lua_pushcclosure( lua_State * L, lua_CFunction f, int n ) { p_lua_pushcclosure( L, f, n ); }
 void lua_createtable( lua_State * L, int a, int b ) { p_lua_createtable( L, a, b ); }
@@ -207,6 +210,7 @@ void * lua_newuserdata( lua_State * L, size_t sz ) { return p_lua_newuserdata( L
 void lua_getfield( lua_State * L, int i, const char * k ) { p_lua_getfield( L, i, k ); }
 void lua_setfield( lua_State * L, int i, const char * k ) { p_lua_setfield( L, i, k ); }
 void lua_rawgeti( lua_State * L, int i, int n ) { p_lua_rawgeti( L, i, n ); }
+void lua_rawseti( lua_State * L, int i, int n ) { p_lua_rawseti( L, i, n ); }
 void lua_call( lua_State * L, int a, int r ) { p_lua_call( L, a, r ); }
 int lua_error( lua_State * L ) { return p_lua_error( L ); }
 int luaL_loadbuffer( lua_State * L, const char * b, size_t sz, const char * name ) { return p_luaL_loadbuffer( L, b, sz, name ); }
@@ -333,6 +337,10 @@ typedef struct FrameUniforms {
     float camPos[4];     /* camera position: fog distance on the CPU, u_S3D_Eye for reflections */
 } FrameUniforms;
 
+/* camera axes for billboards (s3d.newSprite), from the view matrix in setCamera */
+static float gBillRight[3] = { 1, 0, 0 }, gBillUp[3] = { 0, 1, 0 }, gBillBack[3] = { 0, 0, 1 };
+static float gBillRightY[3] = { 1, 0, 0 }, gBillBackY[3] = { 0, 0, 1 }; /* horizontal versions (upright sprites) */
+
 typedef struct DepthState {
     unsigned char depthTest;
     unsigned char depthWrite;
@@ -360,7 +368,9 @@ enum {
     kFlag_PassEnd   = 1u << 9,  /* marker: restore Solar2D's FBO */
     kFlag_NoShadowU = 1u << 10, /* effect does not sample the shadow map */
     kFlag_StyleU    = 1u << 11, /* effect has the style uniforms (u_S3D_AmbientSky ... u_S3D_FocusColor) */
-    kFlag_EnvU      = 1u << 12  /* effect has the reflection uniforms (u_S3D_Eye, u_S3D_Env) */
+    kFlag_EnvU      = 1u << 12, /* effect has the reflection uniforms (u_S3D_Eye, u_S3D_Env) */
+    kFlag_Billboard = 1u << 13, /* sprite: the quad (x, y) faces the camera, centered on the model's position */
+    kFlag_BillboardY= 1u << 14  /* with kFlag_Billboard: only turns around Y (stays upright: trees, characters) */
 };
 
 typedef struct UniformCommand {
@@ -861,7 +871,27 @@ static void s3d_position_writer( void * dest, const void * context, const Corona
             in[0] = p[0]; in[1] = p[1]; in[2] = p[2];
         }
         in[3] = 1.0f;
-        if (inst->flags & kFlag_HasModel)
+        if (inst->flags & kFlag_Billboard)
+        {
+            /* sprite: (x, y) of the quad along the camera's right and up axes, scaled like the model */
+            const float * m = inst->model;
+            const int upright = ( inst->flags & kFlag_BillboardY ) != 0;
+            const float * r = upright ? gBillRightY : gBillRight;
+            static const float kUp[3] = { 0.0f, 1.0f, 0.0f };
+            const float * u = upright ? kUp : gBillUp;
+            float sx = 1.0f, sy = 1.0f, c[3] = { 0.0f, 0.0f, 0.0f };
+            int j;
+
+            if (inst->flags & kFlag_HasModel)
+            {
+                c[0] = m[12]; c[1] = m[13]; c[2] = m[14];
+                sx = sqrtf( m[0] * m[0] + m[1] * m[1] + m[2] * m[2] );
+                sy = sqrtf( m[4] * m[4] + m[5] * m[5] + m[6] * m[6] );
+            }
+            for (j = 0; j < 3; ++j) out[j] = c[j] + r[j] * in[0] * sx + u[j] * in[1] * sy;
+            out[3] = 1.0f;
+        }
+        else if (inst->flags & kFlag_HasModel)
         {
             glm_mat4_mulv( *(mat4 *)inst->model, in, out );
         }
@@ -916,7 +946,11 @@ static void s3d_normal_writer( void * dest, const void * context, const CoronaGe
             nIn[1] = inst->normals[3 * vi + 1];
             nIn[2] = inst->normals[3 * vi + 2];
         }
-        if (inst->flags & kFlag_HasModel)
+        if (inst->flags & kFlag_Billboard)
+        {
+            glm_vec3_copy( ( inst->flags & kFlag_BillboardY ) ? gBillBackY : gBillBack, nOut ); /* faces the camera */
+        }
+        else if (inst->flags & kFlag_HasModel)
         {
             glm_mat3_mulv( *(mat3 *)inst->normalMat, nIn, nOut );
         }
@@ -1176,7 +1210,7 @@ static char * s3d_replace( const char * src, const char * from, const char * to 
     return out;
 }
 
-static char * s3d_transform_vertex( const char * src )
+static char * s3d_transform_vertex( const char * src, int instanced )
 {
     /* When drawing into an FBO (snapshot/canvas), Solar2D's 2D projection flips y (m[1][1] > 0): flip to match */
     /* Light space (shadow map) is not flipped: casters (ViewProj == LightVP) draw straight into the plugin's FBO */
@@ -1186,6 +1220,23 @@ static char * s3d_transform_vertex( const char * src )
         "    v_S3D_ShadowPos = u_S3D_LightVP * vec4( a_Position, 1.0 );\n"
         "    v_S3D_Depth = gl_Position.w;\n"
         "    v_S3D_World = a_Position;";
+    /* Instanced (vertex extension "s3dInst", s3d.newInstances): a_Position / a_UserData are in the model's own space;
+       each instance has a position + uniform scale (a_s3dInstPose), a rotation quaternion (a_s3dInstRot) and a color
+       (a_s3dInstColor). v' = v + w t + q x t, t = 2 q x v rotates by a unit quaternion. */
+    static const char * kPositionInstanced =
+        "vec3 s3dL = a_Position * a_s3dInstPose.w;\n"
+        "    vec3 s3dT = 2.0 * cross( a_s3dInstRot.xyz, s3dL );\n"
+        "    vec3 s3dW = s3dL + a_s3dInstRot.w * s3dT + cross( a_s3dInstRot.xyz, s3dT ) + a_s3dInstPose.xyz;\n"
+        "    vec3 s3dN = 2.0 * cross( a_s3dInstRot.xyz, a_UserData.xyz );\n"
+        "    v_UserData.xyz = a_UserData.xyz + a_s3dInstRot.w * s3dN + cross( a_s3dInstRot.xyz, s3dN );\n"
+        "    v_ColorScale = a_ColorScale * vec4( a_s3dInstColor.rgb * a_s3dInstColor.a, a_s3dInstColor.a );\n"
+        "    gl_Position = u_S3D_ViewProj * vec4( s3dW, 1.0 );\n"
+        "    bool s3dCaster = u_S3D_ViewProj[0] == u_S3D_LightVP[0] && u_S3D_ViewProj[3] == u_S3D_LightVP[3];\n"
+        "    if ( !s3dCaster && u_ViewProjectionMatrix[1][1] > 0.0 ) { gl_Position.y = -gl_Position.y; }\n"
+        "    v_S3D_ShadowPos = u_S3D_LightVP * vec4( s3dW, 1.0 );\n"
+        "    v_S3D_Depth = gl_Position.w;\n"
+        "    v_S3D_World = s3dW;";
+    const char * position = instanced ? kPositionInstanced : kPosition;
     char * a, * b, * c, * d, * gp, * semi;
     size_t pre, total;
 
@@ -1215,11 +1266,11 @@ static char * s3d_transform_vertex( const char * src )
     semi = strchr( gp, ';' );
     if (!semi) { free( c ); return NULL; }
     pre = (size_t)( gp - c );
-    total = pre + strlen( kPosition ) + strlen( semi + 1 ) + 1;
+    total = pre + strlen( position ) + strlen( semi + 1 ) + 1;
     d = (char *)malloc( total );
     if (!d) { free( c ); return NULL; }
     memcpy( d, c, pre );
-    strcpy( d + pre, kPosition );
+    strcpy( d + pre, position );
     strcat( d + pre, semi + 1 );
     free( c );
     return d;
@@ -1248,11 +1299,23 @@ static const char ** s3d_shell_begin( CoronaShellTransformParams * params, void 
     }
     if (0 != strcmp( params->type, "vertex" )) return params->sources;
 
+    {
+        int instanced = 0;
+
+        /* effects using the "s3dInst" vertex extension get its attributes declared in their own source segment */
+        for (i = 0; i < params->nsources; ++i)
+        {
+            if (params->hints[i] && 0 == strcmp( params->hints[i], "extensionAttributes" ) && params->sources[i]
+                && strstr( params->sources[i], "a_s3dInstPose" ))
+            {
+                instanced = 1;
+            }
+        }
     for (i = 0; i < params->nsources; ++i)
     {
         if (params->hints[i] && 0 == strcmp( params->hints[i], "vertexSource" ))
         {
-            char * out = s3d_transform_vertex( params->sources[i] );
+            char * out = s3d_transform_vertex( params->sources[i], instanced );
 
             if (out)
             {
@@ -1265,6 +1328,7 @@ static const char ** s3d_shell_begin( CoronaShellTransformParams * params, void 
             }
             break;
         }
+    }
     }
     return params->sources;
 }
@@ -1628,6 +1692,18 @@ static int s3d_l_set_camera( lua_State * L )
     memcpy( gFrame.viewProj, vp, sizeof( gFrame.viewProj ) );
     gFrame.camPos[0] = eye[0]; gFrame.camPos[1] = eye[1]; gFrame.camPos[2] = eye[2]; gFrame.camPos[3] = 1.0f;
 
+    /* the rows of the view matrix are the camera's right, up and back axes (cglm matrices are column-major) */
+    {
+        int i;
+        float h;
+
+        for (i = 0; i < 3; ++i) { gBillRight[i] = view[i][0]; gBillUp[i] = view[i][1]; gBillBack[i] = view[i][2]; }
+        h = sqrtf( gBillRight[0] * gBillRight[0] + gBillRight[2] * gBillRight[2] );
+        if (h > 1e-5f) { gBillRightY[0] = gBillRight[0] / h; gBillRightY[1] = 0.0f; gBillRightY[2] = gBillRight[2] / h; }
+        /* back, horizontal = right x up(0, 1, 0) rotated: ( -right.z, 0, right.x ) */
+        gBillBackY[0] = -gBillRightY[2]; gBillBackY[1] = 0.0f; gBillBackY[2] = gBillRightY[0];
+    }
+
     CORONA( CoronaRendererInvalidate )( L );
     return 0;
 }
@@ -1862,6 +1938,763 @@ static int s3d_l_dyn_update( lua_State * L )
     return 0;
 }
 
+
+/* ========================================================================== */
+/* glTF 2.0 (cgltf, MIT, https://github.com/jkuhlmann/cgltf)                    */
+/* ========================================================================== */
+/* s3d._gltfLoad( bytes ) -> model table. Self-contained files: .glb, or .gltf with base64 data: URIs (external .bin
+   files cannot be opened from an Android APK). The rest pose is baked: every mesh node's primitives are transformed by
+   the node's world matrix and gathered per material into plain triangle lists (P, U, N), one Solar2D mesh each. */
+#define CGLTF_IMPLEMENTATION
+#include "cgltf.h"
+
+typedef struct GltfGroup {
+    const cgltf_material * material;
+    float * P, * U, * N;
+    unsigned int * node; /* animated models: per vertex, the node it belongs to */
+    float * LP, * LN;    /* idem: position and normal in that node's space */
+    size_t count, cap;   /* vertices */
+} GltfGroup;
+
+/* ---- node animation (rigid parts, no skins) ---- */
+#define S3D_RIG_MAGIC 0x53335247u /* "S3RG" */
+enum { kPath_T = 0, kPath_R, kPath_S };
+enum { kInterp_Linear = 0, kInterp_Step, kInterp_Cubic };
+
+typedef struct RigNode {
+    int parent;
+    int hasMatrix;
+    float t[3], r[4], s[3];
+    float m[16];
+} RigNode;
+
+typedef struct RigChannel {
+    int node, path, interp;
+    unsigned int keys, comps;
+    float * times;
+    float * values; /* keys * comps, or keys * 3 * comps for cubic splines (in-tangent, value, out-tangent) */
+} RigChannel;
+
+typedef struct RigClip {
+    float duration;
+    unsigned int first, count; /* channels */
+} RigClip;
+
+typedef struct RigPart {
+    unsigned int count;
+    unsigned int * node;
+    float * lp, * ln;
+    float * outP, * outN; /* Lua-owned buffers (the mesh's morph source) */
+} RigPart;
+
+typedef struct Rig {
+    unsigned int magic;
+    unsigned int nodeCount, clipCount, partCount;
+    float origin[3], scale;
+    RigNode * nodes;
+    RigClip * clips;
+    RigChannel * channels;
+    RigPart * parts;
+    float * trsA, * trsB; /* nodeCount * 10: t, r, s */
+    float * world;        /* nodeCount * 16 */
+    float * normal;       /* nodeCount * 9 */
+    unsigned char * state;
+} Rig;
+
+static int s3d_gltf_group_reserve( GltfGroup * g, size_t more, int rigged )
+{
+    if (g->count + more <= g->cap) return 1;
+    {
+        size_t cap = g->cap ? g->cap * 2 : 1024;
+        float * P, * U, * N;
+
+        while (cap < g->count + more) cap *= 2;
+        P = (float *)realloc( g->P, cap * 3 * sizeof( float ) ); if (P) g->P = P;
+        U = (float *)realloc( g->U, cap * 2 * sizeof( float ) ); if (U) g->U = U;
+        N = (float *)realloc( g->N, cap * 3 * sizeof( float ) ); if (N) g->N = N;
+        if (!P || !U || !N) return 0;
+        if (rigged)
+        {
+            unsigned int * nd = (unsigned int *)realloc( g->node, cap * sizeof( unsigned int ) );
+            float * lp, * ln;
+            if (nd) g->node = nd;
+            lp = (float *)realloc( g->LP, cap * 3 * sizeof( float ) ); if (lp) g->LP = lp;
+            ln = (float *)realloc( g->LN, cap * 3 * sizeof( float ) ); if (ln) g->LN = ln;
+            if (!nd || !lp || !ln) return 0;
+        }
+        g->cap = cap;
+    }
+    return 1;
+}
+
+static void s3d_push_float_array( lua_State * L, const float * a, size_t n )
+{
+    size_t i;
+
+    lua_createtable( L, (int)n, 0 );
+    for (i = 0; i < n; ++i)
+    {
+        lua_pushnumber( L, a[i] );
+        lua_rawseti( L, -2, (int)i + 1 );
+    }
+}
+
+static int s3d_gltf_index_of( const void * base, const void * item, size_t size ) { return (int)( ( (const char *)item - (const char *)base ) / size ); }
+
+
+static void s3d_gltf_free_groups( GltfGroup * groups, size_t ng )
+{
+    size_t gi;
+    for (gi = 0; gi < ng; ++gi)
+    {
+        free( groups[gi].P ); free( groups[gi].U ); free( groups[gi].N );
+        free( groups[gi].node ); free( groups[gi].LP ); free( groups[gi].LN );
+    }
+    free( groups );
+}
+
+static Rig * s3d_check_rig( lua_State * L, int i )
+{
+    Rig * r = (Rig *)lua_touserdata( L, i );
+    if (!r || lua_objlen( L, i ) < sizeof( Rig ) || S3D_RIG_MAGIC != r->magic)
+    {
+        s3d_error( L, "s3d: expected an animated glTF model" );
+        return NULL;
+    }
+    return r;
+}
+
+static size_t s3d_align( size_t n ) { return ( n + 15u ) & ~(size_t)15u; }
+static void * s3d_take( unsigned char ** cur, size_t bytes ) { void * r = *cur; *cur += s3d_align( bytes ); return r; }
+
+/* Builds the rig userdata (one block, owned by Lua) and pushes it; the parts' output buffers are attached later. */
+static void s3d_gltf_push_rig( lua_State * L, const cgltf_data * data, const GltfGroup * groups, size_t ng )
+{
+    size_t bytes, i, c, np = 0, nch = 0, nf = 0, nv = 0, gi;
+    unsigned char * mem, * cur;
+    Rig * rig;
+
+    for (gi = 0; gi < ng; ++gi) if (groups[gi].count) { ++np; nv += groups[gi].count; }
+    for (i = 0; i < data->animations_count; ++i)
+    {
+        const cgltf_animation * an = &data->animations[i];
+        for (c = 0; c < an->channels_count; ++c)
+        {
+            const cgltf_animation_channel * ch = &an->channels[c];
+            if (!ch->target_node || !ch->sampler || ch->target_path == cgltf_animation_path_type_weights) continue;
+            if (ch->target_path == cgltf_animation_path_type_invalid) continue;
+            ++nch;
+            nf += ch->sampler->input->count + cgltf_num_components( ch->sampler->output->type ) * ch->sampler->output->count;
+        }
+    }
+    bytes = s3d_align( sizeof( Rig ) )
+        + s3d_align( sizeof( RigNode ) * data->nodes_count )
+        + s3d_align( sizeof( RigClip ) * data->animations_count )
+        + s3d_align( sizeof( RigChannel ) * nch )
+        + s3d_align( sizeof( RigPart ) * np )
+        + s3d_align( sizeof( float ) * nf )
+        + s3d_align( nv * ( sizeof( unsigned int ) + 6 * sizeof( float ) ) )
+        + s3d_align( sizeof( float ) * data->nodes_count * ( 10 + 10 + 16 + 9 ) )
+        + s3d_align( data->nodes_count + 1 );
+    mem = (unsigned char *)lua_newuserdata( L, bytes );
+    memset( mem, 0, bytes );
+    cur = mem;
+#define S3D_TAKE( type, n ) ( (type *)s3d_take( &cur, sizeof( type ) * (n) ) )
+    rig = S3D_TAKE( Rig, 1 );
+    rig->magic = S3D_RIG_MAGIC;
+    rig->nodeCount = (unsigned int)data->nodes_count;
+    rig->clipCount = (unsigned int)data->animations_count;
+    rig->partCount = (unsigned int)np;
+    rig->scale = 1.0f;
+    rig->nodes = S3D_TAKE( RigNode, data->nodes_count );
+    rig->clips = S3D_TAKE( RigClip, data->animations_count );
+    rig->channels = S3D_TAKE( RigChannel, nch );
+    rig->parts = S3D_TAKE( RigPart, np );
+    {
+        float * pool = S3D_TAKE( float, nf );
+        unsigned char * vmem = S3D_TAKE( unsigned char, nv * ( sizeof( unsigned int ) + 6 * sizeof( float ) ) );
+        float * work = S3D_TAKE( float, data->nodes_count * ( 10 + 10 + 16 + 9 ) );
+        unsigned int k = 0, p = 0;
+
+        rig->state = S3D_TAKE( unsigned char, data->nodes_count + 1 );
+        rig->trsA = work;
+        rig->trsB = work + 10 * data->nodes_count;
+        rig->world = work + 20 * data->nodes_count;
+        rig->normal = work + 36 * data->nodes_count;
+
+        for (i = 0; i < data->nodes_count; ++i)
+        {
+            const cgltf_node * n = &data->nodes[i];
+            RigNode * rn = &rig->nodes[i];
+            rn->parent = n->parent ? s3d_gltf_index_of( data->nodes, n->parent, sizeof( cgltf_node ) ) : -1;
+            rn->hasMatrix = n->has_matrix ? 1 : 0;
+            if (n->has_matrix) memcpy( rn->m, n->matrix, sizeof( rn->m ) );
+            rn->t[0] = rn->t[1] = rn->t[2] = 0.0f;
+            rn->r[0] = rn->r[1] = rn->r[2] = 0.0f; rn->r[3] = 1.0f;
+            rn->s[0] = rn->s[1] = rn->s[2] = 1.0f;
+            if (n->has_translation) memcpy( rn->t, n->translation, sizeof( rn->t ) );
+            if (n->has_rotation) memcpy( rn->r, n->rotation, sizeof( rn->r ) );
+            if (n->has_scale) memcpy( rn->s, n->scale, sizeof( rn->s ) );
+        }
+        for (i = 0; i < data->animations_count; ++i)
+        {
+            const cgltf_animation * an = &data->animations[i];
+            RigClip * clip = &rig->clips[i];
+            clip->first = k;
+            for (c = 0; c < an->channels_count; ++c)
+            {
+                const cgltf_animation_channel * ch = &an->channels[c];
+                RigChannel * rc;
+                size_t keys, comps;
+                if (!ch->target_node || !ch->sampler || ch->target_path == cgltf_animation_path_type_weights) continue;
+                if (ch->target_path == cgltf_animation_path_type_invalid) continue;
+                rc = &rig->channels[k++];
+                keys = ch->sampler->input->count;
+                comps = cgltf_num_components( ch->sampler->output->type );
+                rc->node = s3d_gltf_index_of( data->nodes, ch->target_node, sizeof( cgltf_node ) );
+                rc->path = ch->target_path == cgltf_animation_path_type_translation ? kPath_T
+                    : ch->target_path == cgltf_animation_path_type_rotation ? kPath_R : kPath_S;
+                rc->interp = ch->sampler->interpolation == cgltf_interpolation_type_step ? kInterp_Step
+                    : ch->sampler->interpolation == cgltf_interpolation_type_cubic_spline ? kInterp_Cubic : kInterp_Linear;
+                rc->keys = (unsigned int)keys;
+                rc->comps = (unsigned int)comps;
+                rc->times = pool; pool += keys;
+                rc->values = pool; pool += comps * ch->sampler->output->count;
+                cgltf_accessor_unpack_floats( ch->sampler->input, rc->times, keys );
+                cgltf_accessor_unpack_floats( ch->sampler->output, rc->values, comps * ch->sampler->output->count );
+                if (rc->interp == kInterp_Cubic && ch->sampler->output->count < 3 * keys) rc->interp = kInterp_Linear;
+                if (keys && rc->times[keys - 1] > clip->duration) clip->duration = rc->times[keys - 1];
+            }
+            clip->count = k - clip->first;
+        }
+        for (gi = 0; gi < ng; ++gi)
+        {
+            const GltfGroup * g = &groups[gi];
+            RigPart * part;
+            if (!g->count) continue;
+            part = &rig->parts[p++];
+            part->count = (unsigned int)g->count;
+            part->node = (unsigned int *)vmem; vmem += g->count * sizeof( unsigned int );
+            part->lp = (float *)vmem; vmem += g->count * 3 * sizeof( float );
+            part->ln = (float *)vmem; vmem += g->count * 3 * sizeof( float );
+            memcpy( part->node, g->node, g->count * sizeof( unsigned int ) );
+            memcpy( part->lp, g->LP, g->count * 3 * sizeof( float ) );
+            memcpy( part->ln, g->LN, g->count * 3 * sizeof( float ) );
+        }
+    }
+#undef S3D_TAKE
+}
+
+/* value of channel ch at time t into out (comps floats) */
+static void s3d_rig_sample( const RigChannel * ch, float t, float * out )
+{
+    unsigned int n = ch->keys, c = ch->comps, lo = 0, hi, k;
+    float u, dt;
+    const float * a, * b;
+
+    if (!n) return;
+    if (t <= ch->times[0] || n == 1)
+    {
+        a = ch->interp == kInterp_Cubic ? ch->values + c : ch->values;
+        memcpy( out, a, c * sizeof( float ) );
+        return;
+    }
+    if (t >= ch->times[n - 1])
+    {
+        a = ch->interp == kInterp_Cubic ? ch->values + ( 3 * ( n - 1 ) + 1 ) * c : ch->values + ( n - 1 ) * c;
+        memcpy( out, a, c * sizeof( float ) );
+        return;
+    }
+    hi = n - 1;
+    while (hi - lo > 1) { unsigned int mid = ( lo + hi ) / 2; if (ch->times[mid] <= t) lo = mid; else hi = mid; }
+    dt = ch->times[hi] - ch->times[lo];
+    u = dt > 0.0f ? ( t - ch->times[lo] ) / dt : 0.0f;
+    if (ch->interp == kInterp_Step)
+    {
+        memcpy( out, ch->values + lo * c, c * sizeof( float ) );
+        return;
+    }
+    if (ch->interp == kInterp_Cubic)
+    {
+        float u2 = u * u, u3 = u2 * u;
+        float h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+        const float * v0 = ch->values + ( 3 * lo + 1 ) * c, * b0 = ch->values + ( 3 * lo + 2 ) * c;
+        const float * v1 = ch->values + ( 3 * hi + 1 ) * c, * a1 = ch->values + ( 3 * hi ) * c;
+        for (k = 0; k < c; ++k) out[k] = h00 * v0[k] + h10 * dt * b0[k] + h01 * v1[k] + h11 * dt * a1[k];
+    }
+    else
+    {
+        a = ch->values + lo * c;
+        b = ch->values + hi * c;
+        if (ch->path == kPath_R && c == 4)
+        {
+            versor qa, qb, q;
+            memcpy( qa, a, sizeof( qa ) ); memcpy( qb, b, sizeof( qb ) );
+            glm_quat_slerp( qa, qb, u, q );
+            memcpy( out, q, sizeof( q ) );
+            return;
+        }
+        for (k = 0; k < c; ++k) out[k] = a[k] + ( b[k] - a[k] ) * u;
+    }
+    if (ch->path == kPath_R && c == 4)
+    {
+        float l = sqrtf( out[0] * out[0] + out[1] * out[1] + out[2] * out[2] + out[3] * out[3] );
+        if (l > 0.0f) for (k = 0; k < 4; ++k) out[k] /= l;
+    }
+}
+
+/* trs[node * 10] = t(3), r(4), s(3): rest pose, then the clip's channels at time t */
+static void s3d_rig_local( const Rig * rig, int clip, float t, float * trs )
+{
+    unsigned int i;
+
+    for (i = 0; i < rig->nodeCount; ++i)
+    {
+        const RigNode * n = &rig->nodes[i];
+        memcpy( trs + 10 * i, n->t, 3 * sizeof( float ) );
+        memcpy( trs + 10 * i + 3, n->r, 4 * sizeof( float ) );
+        memcpy( trs + 10 * i + 7, n->s, 3 * sizeof( float ) );
+    }
+    if (clip < 0 || (unsigned int)clip >= rig->clipCount) return;
+    {
+        const RigClip * c = &rig->clips[clip];
+        for (i = 0; i < c->count; ++i)
+        {
+            const RigChannel * ch = &rig->channels[c->first + i];
+            float * dst = trs + 10 * ch->node + ( ch->path == kPath_T ? 0 : ch->path == kPath_R ? 3 : 7 );
+            float v[4];
+            if ((unsigned int)ch->node >= rig->nodeCount) continue;
+            if (ch->comps != ( ch->path == kPath_R ? 4u : 3u )) continue;
+            s3d_rig_sample( ch, t, v );
+            memcpy( dst, v, ch->comps * sizeof( float ) );
+        }
+    }
+}
+
+static void s3d_rig_world( Rig * rig, unsigned int i )
+{
+    const RigNode * n = &rig->nodes[i];
+    float * w = rig->world + 16 * i;
+    mat4 local;
+
+    if (rig->state[i]) return;
+    if (n->hasMatrix) memcpy( local, n->m, sizeof( local ) );
+    else
+    {
+        const float * trs = rig->trsA + 10 * i;
+        versor q;
+        vec3 s;
+        mat4 r;
+        memcpy( q, trs + 3, sizeof( q ) );
+        memcpy( s, trs + 7, sizeof( s ) );
+        glm_translate_make( local, (float *)trs );
+        glm_quat_mat4( q, r );
+        glm_mat4_mul( local, r, local );
+        glm_scale( local, s );
+    }
+    if (n->parent >= 0 && (unsigned int)n->parent < rig->nodeCount && n->parent != (int)i)
+    {
+        rig->state[i] = 2; /* in progress: guards against cycles in broken files */
+        if (rig->state[n->parent] != 2) s3d_rig_world( rig, (unsigned int)n->parent );
+        {
+            mat4 pw; /* userdata is only 8-byte aligned: copy before the (SIMD) multiplication */
+            memcpy( pw, rig->world + 16 * n->parent, sizeof( pw ) );
+            glm_mat4_mul( pw, local, local );
+        }
+    }
+    memcpy( w, local, sizeof( local ) );
+    {
+        mat3 nm;
+        glm_mat4_pick3( local, nm );
+        glm_mat3_inv( nm, nm );
+        glm_mat3_transpose( nm );
+        memcpy( rig->normal + 9 * i, nm, sizeof( nm ) );
+    }
+    rig->state[i] = 1;
+}
+
+/* s3d._gltfSetOrigin( rig, ox, oy, oz, scale ): output = ( world - origin ) * scale, as the static parts */
+static int s3d_l_gltf_set_origin( lua_State * L )
+{
+    Rig * rig = s3d_check_rig( L, 1 );
+    rig->origin[0] = s3d_optnum( L, 2, 0 );
+    rig->origin[1] = s3d_optnum( L, 3, 0 );
+    rig->origin[2] = s3d_optnum( L, 4, 0 );
+    rig->scale = s3d_optnum( L, 5, 1 );
+    return 0;
+}
+
+/* s3d._gltfAttach( rig, part (1-based) ) -> outP, outN: the buffers the part's mesh uses as its morph source */
+static int s3d_l_gltf_attach( lua_State * L )
+{
+    Rig * rig = s3d_check_rig( L, 1 );
+    unsigned int p = (unsigned int)s3d_optnum( L, 2, 0 );
+    RigPart * part;
+
+    if (p < 1 || p > rig->partCount) return s3d_error( L, "s3d: part %u is out of range", p );
+    part = &rig->parts[p - 1];
+    part->outP = (float *)lua_newuserdata( L, sizeof( float ) * 3 * part->count );
+    part->outN = (float *)lua_newuserdata( L, sizeof( float ) * 3 * part->count );
+    return 2;
+}
+
+/* s3d._gltfDuration( rig ) -> { seconds per clip } */
+static int s3d_l_gltf_durations( lua_State * L )
+{
+    Rig * rig = s3d_check_rig( L, 1 );
+    unsigned int i;
+    lua_createtable( L, (int)rig->clipCount, 0 );
+    for (i = 0; i < rig->clipCount; ++i) { lua_pushnumber( L, rig->clips[i].duration ); lua_rawseti( L, -2, (int)i + 1 ); }
+    return 1;
+}
+
+/* s3d._gltfCloneRig( rig ) -> a copy for another model instance (own pose and output buffers, none attached yet) */
+static int s3d_l_gltf_clone_rig( lua_State * L )
+{
+    Rig * src = s3d_check_rig( L, 1 );
+    size_t bytes = lua_objlen( L, 1 ), i;
+    unsigned char * mem = (unsigned char *)lua_newuserdata( L, bytes );
+    const unsigned char * base = (const unsigned char *)src;
+    Rig * r;
+
+    memcpy( mem, src, bytes );
+    r = (Rig *)mem;
+#define S3D_RELOC( ptr ) do { if (ptr) ( ptr ) = (void *)( mem + ( (const unsigned char *)( ptr ) - base ) ); } while (0)
+    S3D_RELOC( r->nodes ); S3D_RELOC( r->clips ); S3D_RELOC( r->channels ); S3D_RELOC( r->parts );
+    S3D_RELOC( r->trsA ); S3D_RELOC( r->trsB ); S3D_RELOC( r->world ); S3D_RELOC( r->normal ); S3D_RELOC( r->state );
+    {
+        unsigned int c, n = 0;
+        for (c = 0; c < r->clipCount; ++c) if (r->clips[c].first + r->clips[c].count > n) n = r->clips[c].first + r->clips[c].count;
+        for (c = 0; c < n; ++c) { S3D_RELOC( r->channels[c].times ); S3D_RELOC( r->channels[c].values ); }
+    }
+    for (i = 0; i < r->partCount; ++i)
+    {
+        RigPart * part = &r->parts[i];
+        S3D_RELOC( part->node ); S3D_RELOC( part->lp ); S3D_RELOC( part->ln );
+        part->outP = part->outN = NULL;
+    }
+#undef S3D_RELOC
+    return 1;
+}
+
+/* s3d._gltfPose( rig, clip, time [, clip2, time2, weight] ): clips are 1-based (0 = rest pose); the second clip is
+   blended over the first with `weight` (cross-fades). Writes every attached part's positions and normals. */
+static int s3d_l_gltf_pose( lua_State * L )
+{
+    Rig * rig = s3d_check_rig( L, 1 );
+    int clipA = (int)s3d_optnum( L, 2, 0 ) - 1, clipB = (int)s3d_optnum( L, 4, 0 ) - 1;
+    float tA = s3d_optnum( L, 3, 0 ), tB = s3d_optnum( L, 5, 0 ), w = s3d_optnum( L, 6, 0 );
+    unsigned int i, p;
+
+    s3d_rig_local( rig, clipA, tA, rig->trsA );
+    if (clipB >= 0 && w > 0.0f)
+    {
+        s3d_rig_local( rig, clipB, tB, rig->trsB );
+        if (w > 1.0f) w = 1.0f;
+        for (i = 0; i < rig->nodeCount; ++i)
+        {
+            float * a = rig->trsA + 10 * i;
+            const float * b = rig->trsB + 10 * i;
+            versor qa, qb, q;
+            int k;
+            for (k = 0; k < 3; ++k) { a[k] += ( b[k] - a[k] ) * w; a[7 + k] += ( b[7 + k] - a[7 + k] ) * w; }
+            memcpy( qa, a + 3, sizeof( qa ) ); memcpy( qb, b + 3, sizeof( qb ) );
+            glm_quat_slerp( qa, qb, w, q );
+            memcpy( a + 3, q, sizeof( q ) );
+        }
+    }
+    memset( rig->state, 0, rig->nodeCount );
+    for (i = 0; i < rig->nodeCount; ++i) s3d_rig_world( rig, i );
+
+    for (p = 0; p < rig->partCount; ++p)
+    {
+        const RigPart * part = &rig->parts[p];
+        float * op = part->outP, * on = part->outN;
+        float sc = rig->scale;
+        unsigned int v;
+
+        if (!op || !on) continue;
+        for (v = 0; v < part->count; ++v)
+        {
+            unsigned int ni = part->node[v];
+            const float * m, * nm, * lp = part->lp + 3 * v, * ln = part->ln + 3 * v;
+            float x, y, z, l;
+
+            if (ni >= rig->nodeCount) ni = 0;
+            m = rig->world + 16 * ni;
+            nm = rig->normal + 9 * ni;
+            x = m[0] * lp[0] + m[4] * lp[1] + m[8] * lp[2] + m[12];
+            y = m[1] * lp[0] + m[5] * lp[1] + m[9] * lp[2] + m[13];
+            z = m[2] * lp[0] + m[6] * lp[1] + m[10] * lp[2] + m[14];
+            op[3 * v] = ( x - rig->origin[0] ) * sc;
+            op[3 * v + 1] = ( y - rig->origin[1] ) * sc;
+            op[3 * v + 2] = ( z - rig->origin[2] ) * sc;
+            x = nm[0] * ln[0] + nm[3] * ln[1] + nm[6] * ln[2];
+            y = nm[1] * ln[0] + nm[4] * ln[1] + nm[7] * ln[2];
+            z = nm[2] * ln[0] + nm[5] * ln[1] + nm[8] * ln[2];
+            l = sqrtf( x * x + y * y + z * z );
+            if (l > 0.0f) { x /= l; y /= l; z /= l; }
+            on[3 * v] = x; on[3 * v + 1] = y; on[3 * v + 2] = z;
+        }
+    }
+    return 0;
+}
+
+static int s3d_l_gltf_load( lua_State * L )
+{
+    size_t len = 0, gi, ng = 0, i;
+    const char * bytes = lua_tolstring( L, 1, &len );
+    cgltf_options options;
+    cgltf_data * data = NULL;
+    cgltf_result r;
+    GltfGroup * groups;
+    float bmin[3] = { 1e30f, 1e30f, 1e30f }, bmax[3] = { -1e30f, -1e30f, -1e30f };
+    char err[160];
+    int rigged;
+
+    if (!bytes || len < 12) return s3d_error( L, "s3d.loadGLTF: empty file" );
+    memset( &options, 0, sizeof( options ) );
+    r = cgltf_parse( &options, bytes, len, &data );
+    if (r != cgltf_result_success) return s3d_error( L, "s3d.loadGLTF: not a valid glTF / GLB file (cgltf error %d)", (int)r );
+    r = cgltf_load_buffers( &options, data, "" );
+    if (r != cgltf_result_success)
+    {
+        cgltf_free( data );
+        return s3d_error( L, "s3d.loadGLTF: could not load the buffers (cgltf error %d): use .glb, or .gltf with embedded data", (int)r );
+    }
+
+    /* one group per material (+1 for primitives without one) */
+    groups = (GltfGroup *)calloc( data->materials_count + 1, sizeof( GltfGroup ) );
+    if (!groups) { cgltf_free( data ); return s3d_error( L, "s3d.loadGLTF: out of memory" ); }
+    for (i = 0; i < data->materials_count; ++i) groups[i].material = &data->materials[i];
+    ng = data->materials_count + 1;
+    err[0] = 0;
+    rigged = data->animations_count > 0 && !lua_toboolean( L, 2 ); /* arg 2: static (skip the animation data) */
+
+    for (i = 0; i < data->nodes_count && !err[0]; ++i)
+    {
+        const cgltf_node * node = &data->nodes[i];
+        float world[16];
+        mat4 m;
+        mat3 nm;
+        int flip;
+        size_t pi;
+
+        if (!node->mesh) continue;
+        cgltf_node_transform_world( node, world );
+        memcpy( m, world, sizeof( world ) ); /* both column-major */
+        glm_mat4_pick3( m, nm );
+        flip = glm_mat3_det( nm ) < 0.0f;
+        glm_mat3_inv( nm, nm );
+        glm_mat3_transpose( nm );
+
+        for (pi = 0; pi < node->mesh->primitives_count; ++pi)
+        {
+            const cgltf_primitive * prim = &node->mesh->primitives[pi];
+            const cgltf_accessor * pos = NULL, * nor = NULL, * uv = NULL;
+            size_t a, n, t;
+            GltfGroup * g;
+
+            if (prim->type != cgltf_primitive_type_triangles) continue;
+            for (a = 0; a < prim->attributes_count; ++a)
+            {
+                const cgltf_attribute * at = &prim->attributes[a];
+                if (at->type == cgltf_attribute_type_position) pos = at->data;
+                else if (at->type == cgltf_attribute_type_normal) nor = at->data;
+                else if (at->type == cgltf_attribute_type_texcoord && at->index == 0) uv = at->data;
+            }
+            if (!pos) continue;
+            g = prim->material ? &groups[s3d_gltf_index_of( data->materials, prim->material, sizeof( cgltf_material ) )] : &groups[ng - 1];
+            n = prim->indices ? prim->indices->count : pos->count;
+            n -= n % 3;
+            if (!s3d_gltf_group_reserve( g, n, rigged )) { strcpy( err, "out of memory" ); break; }
+            for (t = 0; t < n; t += 3)
+            {
+                size_t k;
+                vec3 p[3], nn[3], lpos[3], lnor[3];
+                float tc[3][2];
+
+                for (k = 0; k < 3; ++k)
+                {
+                    size_t vi = prim->indices ? cgltf_accessor_read_index( prim->indices, t + k ) : t + k;
+                    vec4 lp = { 0, 0, 0, 1 }, wp;
+                    vec3 ln = { 0, 1, 0 };
+
+                    cgltf_accessor_read_float( pos, vi, lp, 3 );
+                    glm_vec3_copy( lp, lpos[k] );
+                    glm_mat4_mulv( m, lp, wp );
+                    glm_vec3_copy( wp, p[k] );
+                    if (nor) cgltf_accessor_read_float( nor, vi, ln, 3 );
+                    glm_vec3_copy( ln, lnor[k] );
+                    glm_mat3_mulv( nm, ln, nn[k] );
+                    glm_vec3_normalize( nn[k] );
+                    tc[k][0] = tc[k][1] = 0.0f;
+                    if (uv) cgltf_accessor_read_float( uv, vi, tc[k], 2 );
+                }
+                if (!nor)
+                {
+                    /* flat normal from the triangle */
+                    vec3 e1, e2, fn;
+                    glm_vec3_sub( p[1], p[0], e1 ); glm_vec3_sub( p[2], p[0], e2 ); glm_vec3_cross( e1, e2, fn ); glm_vec3_normalize( fn );
+                    if (flip) glm_vec3_negate( fn );
+                    glm_vec3_copy( fn, nn[0] ); glm_vec3_copy( fn, nn[1] ); glm_vec3_copy( fn, nn[2] );
+                    /* in the node's space: the normal matrix maps the local cross product to the front-face normal,
+                       mirrored nodes included */
+                    glm_vec3_sub( lpos[1], lpos[0], e1 ); glm_vec3_sub( lpos[2], lpos[0], e2 ); glm_vec3_cross( e1, e2, fn ); glm_vec3_normalize( fn );
+                    glm_vec3_copy( fn, lnor[0] ); glm_vec3_copy( fn, lnor[1] ); glm_vec3_copy( fn, lnor[2] );
+                }
+                for (k = 0; k < 3; ++k)
+                {
+                    size_t src = flip ? 2 - k : k; /* mirrored nodes: keep counter-clockwise front faces */
+                    size_t o = g->count;
+                    int c;
+
+                    for (c = 0; c < 3; ++c)
+                    {
+                        g->P[3 * o + c] = p[src][c];
+                        g->N[3 * o + c] = nn[src][c];
+                        if (p[src][c] < bmin[c]) bmin[c] = p[src][c];
+                        if (p[src][c] > bmax[c]) bmax[c] = p[src][c];
+                    }
+                    g->U[2 * o] = tc[src][0];
+                    g->U[2 * o + 1] = tc[src][1];
+                    if (rigged)
+                    {
+                        g->node[o] = (unsigned int)i;
+                        memcpy( g->LP + 3 * o, lpos[src], 3 * sizeof( float ) );
+                        memcpy( g->LN + 3 * o, lnor[src], 3 * sizeof( float ) );
+                    }
+                    g->count++;
+                }
+            }
+        }
+    }
+    if (err[0])
+    {
+        s3d_gltf_free_groups( groups, ng ); cgltf_free( data );
+        return s3d_error( L, "s3d.loadGLTF: %s", err );
+    }
+
+    lua_createtable( L, 0, 6 );
+
+    /* groups = { { material = i (1-based, 0 = none), P = {}, U = {}, N = {} }, ... } */
+    lua_createtable( L, (int)ng, 0 );
+    {
+        int out = 0;
+        for (gi = 0; gi < ng; ++gi)
+        {
+            GltfGroup * g = &groups[gi];
+            if (!g->count) continue;
+            lua_createtable( L, 0, 4 );
+            lua_pushnumber( L, g->material ? (lua_Number)( gi + 1 ) : 0 ); lua_setfield( L, -2, "material" );
+            s3d_push_float_array( L, g->P, g->count * 3 ); lua_setfield( L, -2, "P" );
+            s3d_push_float_array( L, g->U, g->count * 2 ); lua_setfield( L, -2, "U" );
+            s3d_push_float_array( L, g->N, g->count * 3 ); lua_setfield( L, -2, "N" );
+            lua_rawseti( L, -2, ++out );
+        }
+    }
+    lua_setfield( L, -2, "groups" );
+
+    /* materials = { { name, image (1-based), color = { r, g, b, a }, alphaMode, alphaCutoff, doubleSided, nearest } } */
+    lua_createtable( L, (int)data->materials_count, 0 );
+    for (i = 0; i < data->materials_count; ++i)
+    {
+        const cgltf_material * mt = &data->materials[i];
+        const cgltf_texture * tex = mt->has_pbr_metallic_roughness ? mt->pbr_metallic_roughness.base_color_texture.texture : NULL;
+        const float * f = mt->has_pbr_metallic_roughness ? mt->pbr_metallic_roughness.base_color_factor : NULL;
+
+        lua_createtable( L, 0, 7 );
+        lua_pushstring( L, mt->name ? mt->name : "" ); lua_setfield( L, -2, "name" );
+        if (tex && tex->image) { lua_pushnumber( L, s3d_gltf_index_of( data->images, tex->image, sizeof( cgltf_image ) ) + 1 ); lua_setfield( L, -2, "image" ); }
+        if (tex && tex->sampler)
+        {
+            lua_pushboolean( L, tex->sampler->mag_filter == 9728 ); /* GL_NEAREST: pixel art (Blockbench) */
+            lua_setfield( L, -2, "nearest" );
+        }
+        lua_createtable( L, 4, 0 );
+        {
+            int c;
+            for (c = 0; c < 4; ++c) { lua_pushnumber( L, f ? f[c] : 1.0f ); lua_rawseti( L, -2, c + 1 ); }
+        }
+        lua_setfield( L, -2, "color" );
+        lua_pushstring( L, mt->alpha_mode == cgltf_alpha_mode_mask ? "MASK" : mt->alpha_mode == cgltf_alpha_mode_blend ? "BLEND" : "OPAQUE" );
+        lua_setfield( L, -2, "alphaMode" );
+        lua_pushnumber( L, mt->alpha_cutoff ); lua_setfield( L, -2, "alphaCutoff" );
+        lua_pushboolean( L, mt->double_sided ); lua_setfield( L, -2, "doubleSided" );
+        lua_rawseti( L, -2, (int)i + 1 );
+    }
+    lua_setfield( L, -2, "materials" );
+
+    /* images = { { data = "...", mime = "image/png", name }, ... } (embedded in the GLB or data: URIs) */
+    lua_createtable( L, (int)data->images_count, 0 );
+    for (i = 0; i < data->images_count; ++i)
+    {
+        const cgltf_image * im = &data->images[i];
+        const char * mime = im->mime_type ? im->mime_type : "image/png";
+
+        lua_createtable( L, 0, 3 );
+        if (im->buffer_view && im->buffer_view->buffer->data)
+        {
+            lua_pushlstring( L, (const char *)im->buffer_view->buffer->data + im->buffer_view->offset, im->buffer_view->size );
+            lua_setfield( L, -2, "data" );
+        }
+        else if (im->uri && 0 == strncmp( im->uri, "data:", 5 ))
+        {
+            const char * comma = strchr( im->uri, ',' );
+            if (comma)
+            {
+                size_t n = strlen( comma + 1 ), size = n / 4 * 3;
+                void * out = NULL;
+                while (n > 0 && comma[n] == '=') { --n; --size; }
+                if (cgltf_load_buffer_base64( &options, size, comma + 1, &out ) == cgltf_result_success)
+                {
+                    lua_pushlstring( L, (const char *)out, size );
+                    lua_setfield( L, -2, "data" );
+                    free( out );
+                }
+            }
+            if (0 == strncmp( im->uri, "data:image/jpeg", 15 )) mime = "image/jpeg";
+        }
+        else if (im->uri)
+        {
+            lua_pushstring( L, im->uri ); lua_setfield( L, -2, "uri" ); /* external image: loaded by Solar2D by name */
+        }
+        lua_pushstring( L, mime ); lua_setfield( L, -2, "mime" );
+        lua_rawseti( L, -2, (int)i + 1 );
+    }
+    lua_setfield( L, -2, "images" );
+
+    /* animations = { "name", ... } (played in a later version) */
+    lua_createtable( L, (int)data->animations_count, 0 );
+    for (i = 0; i < data->animations_count; ++i)
+    {
+        lua_pushstring( L, data->animations[i].name ? data->animations[i].name : "" );
+        lua_rawseti( L, -2, (int)i + 1 );
+    }
+    lua_setfield( L, -2, "animations" );
+
+    lua_createtable( L, 6, 0 );
+    for (i = 0; i < 3; ++i)
+    {
+        lua_pushnumber( L, bmin[i] <= bmax[i] ? bmin[i] : 0 ); lua_rawseti( L, -2, (int)i + 1 );
+    }
+    for (i = 0; i < 3; ++i)
+    {
+        lua_pushnumber( L, bmin[i] <= bmax[i] ? bmax[i] : 0 ); lua_rawseti( L, -2, (int)i + 4 );
+    }
+    lua_setfield( L, -2, "bounds" );
+
+    if (rigged)
+    {
+        s3d_gltf_push_rig( L, data, groups, ng );
+        lua_setfield( L, -2, "rig" );
+    }
+
+    s3d_gltf_free_groups( groups, ng );
+    cgltf_free( data );
+    return 1;
+}
+
 /* s3d._newBuffer( { numbers... } ) -> userdata float[] */
 static int s3d_l_new_buffer( lua_State * L )
 {
@@ -1957,6 +2790,12 @@ S3D_EXPORT int luaopen_plugin_s3d( lua_State * L )
     lua_pushcclosure( L, s3d_l_set_focus, 0 ); lua_setfield( L, -2, "setFocus" );
     lua_pushcclosure( L, s3d_l_bake_ao, 0 ); lua_setfield( L, -2, "bakeAO" );
     lua_pushcclosure( L, s3d_l_new_dynamic, 0 ); lua_setfield( L, -2, "newDynamic" );
+    lua_pushcclosure( L, s3d_l_gltf_load, 0 ); lua_setfield( L, -2, "gltfLoad" );
+    lua_pushcclosure( L, s3d_l_gltf_set_origin, 0 ); lua_setfield( L, -2, "gltfSetOrigin" );
+    lua_pushcclosure( L, s3d_l_gltf_attach, 0 ); lua_setfield( L, -2, "gltfAttach" );
+    lua_pushcclosure( L, s3d_l_gltf_durations, 0 ); lua_setfield( L, -2, "gltfDurations" );
+    lua_pushcclosure( L, s3d_l_gltf_pose, 0 ); lua_setfield( L, -2, "gltfPose" );
+    lua_pushcclosure( L, s3d_l_gltf_clone_rig, 0 ); lua_setfield( L, -2, "gltfCloneRig" );
     lua_pushcclosure( L, s3d_l_dyn_set_positions, 0 ); lua_setfield( L, -2, "dynSetPositions" );
     lua_pushcclosure( L, s3d_l_dyn_set_heights, 0 ); lua_setfield( L, -2, "dynSetHeights" );
     lua_pushcclosure( L, s3d_l_dyn_set_vertex, 0 ); lua_setfield( L, -2, "dynSetVertex" );
