@@ -1,4 +1,4 @@
-# S3DBasic
+# Solar3D
 
 Project for **plugin.s3d**, a native plugin that adds basic 3D to [Solar2D](https://solar2d.com): 3D meshes with
 depth testing, lighting, shadows, fog, post-processing and OBJ models. It is built only on Solar2D's public native API,
