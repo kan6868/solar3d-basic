@@ -30,7 +30,7 @@
 #include "lauxlib.h"
 #include "s3d_corona.h"
 
-#define S3D_VERSION "0.12.0"
+#define S3D_VERSION "0.12.1"
 
 /* ========================================================================== */
 /* Function binding: resolved at run time on Windows, linked directly on Android            */
@@ -381,6 +381,16 @@ typedef struct UniformCommand {
     unsigned int flags;
 } UniformCommand;
 
+/* GPU node transforms (glTF node animation): each vertex carries a node index (vertex extension attribute a_s3dNode);
+   the object's node matrices (rows of a 3x4 affine matrix) go to the vertex shader as the uniform array u_S3D_Nodes,
+   multiplied by the model matrix (and the planar shadow projection) here. 24 nodes = 72 vec4: with Solar2D's own
+   vertex uniforms this stays under the 128 vectors every OpenGL ES 2 device has. */
+#define S3D_MAX_NODES 24
+typedef struct NodeCommand {
+    unsigned int count;
+    float rows[S3D_MAX_NODES * 12];
+} NodeCommand;
+
 typedef struct PassCommand {
     int begin;
     int size;
@@ -441,6 +451,9 @@ typedef struct Instance {
     unsigned int aoCount;
     /* environment reflection (effect filter.s3d.reflect): strength, F0, blur, rotation */
     float env[4];
+    /* GPU node transforms: 12 floats per node (3 rows of the affine matrix), Lua-owned buffer; NULL = CPU path */
+    const float * nodes;
+    unsigned int nodeCount;
 } Instance;
 
 static FrameUniforms gFrame;
@@ -451,7 +464,7 @@ static float gShadowMat[16];
 static float gShadowPlaneY = 0.0f;
 
 /* shadow map */
-static unsigned long gPassCmdID;
+static unsigned long gPassCmdID, gNodeCmdID;
 static float gLightVP[16];
 static float gShadowParams[4] = { 0, 0.003f, 1.0f / 1024, 0.6f };
 static int gShadowSize = 1024;
@@ -763,6 +776,19 @@ static void s3d_pass_reader( const CoronaCommandBuffer * cb, const unsigned char
 }
 
 
+static void s3d_node_reader( const CoronaCommandBuffer * cb, const unsigned char * from, unsigned int size )
+{
+    CoronaWriteUniformParams p;
+    unsigned int count;
+
+    if (size < sizeof( unsigned int )) return;
+    memcpy( &count, from, sizeof( count ) );
+    if (count > S3D_MAX_NODES || size < sizeof( unsigned int ) + count * 12 * sizeof( float )) return;
+    p.useOffset = 0;
+    p.u.data = from + offsetof( NodeCommand, rows );
+    CORONA( CoronaCommandBufferWriteNamedUniform )( cb, "u_S3D_Nodes", &p, count * 12 * sizeof( float ) );
+}
+
 static void s3d_uniform_reader( const CoronaCommandBuffer * cb, const unsigned char * from, unsigned int size )
 {
     CoronaWriteUniformParams p;
@@ -871,7 +897,11 @@ static void s3d_position_writer( void * dest, const void * context, const Corona
             in[0] = p[0]; in[1] = p[1]; in[2] = p[2];
         }
         in[3] = 1.0f;
-        if (inst->flags & kFlag_Billboard)
+        if (inst->nodes)
+        {
+            glm_vec4_copy( in, out ); /* the vertex shader applies u_S3D_Nodes[ a_s3dNode ] */
+        }
+        else if (inst->flags & kFlag_Billboard)
         {
             /* sprite: (x, y) of the quad along the camera's right and up axes, scaled like the model */
             const float * m = inst->model;
@@ -900,7 +930,7 @@ static void s3d_position_writer( void * dest, const void * context, const Corona
             glm_vec4_copy( in, out );
         }
 
-        if (inst->flags & kFlag_Shadow)
+        if (( inst->flags & kFlag_Shadow ) && !inst->nodes)
         {
             /* project onto the plane y = planeY along the light direction, lifted slightly to avoid z-fighting with the floor */
             vec4 s;
@@ -946,7 +976,11 @@ static void s3d_normal_writer( void * dest, const void * context, const CoronaGe
             nIn[1] = inst->normals[3 * vi + 1];
             nIn[2] = inst->normals[3 * vi + 2];
         }
-        if (inst->flags & kFlag_Billboard)
+        if (inst->nodes)
+        {
+            glm_vec3_copy( nIn, nOut );
+        }
+        else if (inst->flags & kFlag_Billboard)
         {
             glm_vec3_copy( ( inst->flags & kFlag_BillboardY ) ? gBillBackY : gBillBack, nOut ); /* faces the camera */
         }
@@ -1012,12 +1046,48 @@ static void s3d_before( const CoronaShader * shader, void * userData, const Coro
         memcpy( uc.env, inst->env, sizeof( uc.env ) );
         CORONA( CoronaRendererIssueCommand )( renderer, gUniformCmdID, &uc, sizeof( uc ) );
     }
+    if (inst->nodes && inst->nodeCount)
+    {
+        static NodeCommand nc; /* only used while issuing (the command buffer copies it) */
+        unsigned int i, n = inst->nodeCount > S3D_MAX_NODES ? S3D_MAX_NODES : inst->nodeCount;
+        float pre[16]; /* column-major: (planar shadow projection) * model */
+
+        if (inst->flags & kFlag_HasModel) memcpy( pre, inst->model, sizeof( pre ) );
+        else { memset( pre, 0, sizeof( pre ) ); pre[0] = pre[5] = pre[10] = pre[15] = 1.0f; }
+        if (( inst->flags & kFlag_Shadow ) && gShadowMat[15] != 0.0f)
+        {
+            /* the directional light's planar projection is affine (w = constant): scale it by 1 / w, then put y on the
+               plane, lifted like the CPU path does */
+            mat4 sm, m;
+            int k;
+
+            for (k = 0; k < 16; ++k) sm[k / 4][k % 4] = gShadowMat[k] / gShadowMat[15];
+            sm[0][1] = sm[1][1] = sm[2][1] = 0.0f; sm[3][1] = gShadowPlaneY + 0.0005f;
+            memcpy( m, pre, sizeof( m ) );
+            glm_mat4_mul( sm, m, m );
+            memcpy( pre, m, sizeof( pre ) );
+        }
+        nc.count = n;
+        for (i = 0; i < n; ++i)
+        {
+            const float * r = inst->nodes + 12 * i;
+            float * o = nc.rows + 12 * i;
+            int k, c;
+
+            /* (pre * node), node given as rows; pre is column-major: element (row k, col c) = pre[c * 4 + k] */
+            for (k = 0; k < 3; ++k)
+                for (c = 0; c < 4; ++c)
+                    o[4 * k + c] = pre[0 * 4 + k] * r[0 + c] + pre[1 * 4 + k] * r[4 + c] + pre[2 * 4 + k] * r[8 + c]
+                        + ( c == 3 ? pre[12 + k] : 0.0f );
+        }
+        CORONA( CoronaRendererIssueCommand )( renderer, gNodeCmdID, &nc, (unsigned int)( sizeof( unsigned int ) + n * 12 * sizeof( float ) ) );
+    }
 
     /* restore the default state so 2D objects drawn later are not affected */
     CORONA( CoronaRendererWriteStateBlock )( renderer, gStateBlockID, &kDepthOff, sizeof( kDepthOff ) );
 }
 
-enum { kData_TRS = 0, kData_Normals, kData_Flags, kData_Matrix, kData_Pose, kData_Morph, kData_AO, kData_Env };
+enum { kData_TRS = 0, kData_Normals, kData_Flags, kData_Matrix, kData_Pose, kData_Morph, kData_AO, kData_Env, kData_Nodes };
 
 static int s3d_data_index( const char * name )
 {
@@ -1029,6 +1099,7 @@ static int s3d_data_index( const char * name )
     if (0 == strcmp( name, "s3dMorph" )) return kData_Morph;
     if (0 == strcmp( name, "s3dAO" )) return kData_AO;
     if (0 == strcmp( name, "s3dEnv" )) return kData_Env;
+    if (0 == strcmp( name, "s3dNodes" )) return kData_Nodes;
     return -1;
 }
 
@@ -1174,6 +1245,11 @@ static int s3d_set_data( lua_State * L, int dataIndex, int valueIndex, void * us
     case kData_Flags:
         inst->flags = ( inst->flags & kFlag_HasModel ) | ( (unsigned int)lua_tonumber( L, valueIndex ) & ~kFlag_HasModel );
         break;
+    case kData_Nodes: /* buffer of 12 floats per node (rows of the 3x4 node -> object matrix), or false: CPU path */
+        inst->nodes = (const float *)lua_touserdata( L, valueIndex );
+        inst->nodeCount = inst->nodes ? (unsigned int)( lua_objlen( L, valueIndex ) / ( 12 * sizeof( float ) ) ) : 0;
+        if (!inst->nodeCount) inst->nodes = NULL;
+        break;
     case kData_Env: /* { strength, F0, blur, rotation (radians) } */
         if (LUA_TTABLE != lua_type( L, valueIndex )) return 0;
         inst->env[0] = s3d_tablenum( L, valueIndex, 1, 0.5f );
@@ -1210,7 +1286,7 @@ static char * s3d_replace( const char * src, const char * from, const char * to 
     return out;
 }
 
-static char * s3d_transform_vertex( const char * src, int instanced )
+static char * s3d_transform_vertex( const char * src, int instanced, int nodes )
 {
     /* When drawing into an FBO (snapshot/canvas), Solar2D's 2D projection flips y (m[1][1] > 0): flip to match */
     /* Light space (shadow map) is not flipped: casters (ViewProj == LightVP) draw straight into the plugin's FBO */
@@ -1236,7 +1312,20 @@ static char * s3d_transform_vertex( const char * src, int instanced )
         "    v_S3D_ShadowPos = u_S3D_LightVP * vec4( s3dW, 1.0 );\n"
         "    v_S3D_Depth = gl_Position.w;\n"
         "    v_S3D_World = s3dW;";
-    const char * position = instanced ? kPositionInstanced : kPosition;
+    /* GPU nodes (vertex extension attribute a_s3dNode): 3x4 matrices as rows, 3 vec4 per node */
+    static const char * kPositionNodes =
+        "int s3dI = int( a_s3dNode + 0.5 ) * 3;\n"
+        "    vec4 s3dP = vec4( a_Position, 1.0 );\n"
+        "    vec4 s3dR0 = u_S3D_Nodes[s3dI]; vec4 s3dR1 = u_S3D_Nodes[s3dI + 1]; vec4 s3dR2 = u_S3D_Nodes[s3dI + 2];\n"
+        "    vec3 s3dW = vec3( dot( s3dR0, s3dP ), dot( s3dR1, s3dP ), dot( s3dR2, s3dP ) );\n"
+        "    v_UserData.xyz = normalize( vec3( dot( s3dR0.xyz, a_UserData.xyz ), dot( s3dR1.xyz, a_UserData.xyz ), dot( s3dR2.xyz, a_UserData.xyz ) ) );\n"
+        "    gl_Position = u_S3D_ViewProj * vec4( s3dW, 1.0 );\n"
+        "    bool s3dCaster = u_S3D_ViewProj[0] == u_S3D_LightVP[0] && u_S3D_ViewProj[3] == u_S3D_LightVP[3];\n"
+        "    if ( !s3dCaster && u_ViewProjectionMatrix[1][1] > 0.0 ) { gl_Position.y = -gl_Position.y; }\n"
+        "    v_S3D_ShadowPos = u_S3D_LightVP * vec4( s3dW, 1.0 );\n"
+        "    v_S3D_Depth = gl_Position.w;\n"
+        "    v_S3D_World = s3dW;";
+    const char * position = nodes ? kPositionNodes : instanced ? kPositionInstanced : kPosition;
     char * a, * b, * c, * d, * gp, * semi;
     size_t pre, total;
 
@@ -1250,8 +1339,11 @@ static char * s3d_transform_vertex( const char * src, int instanced )
     free( c );
 
     /* insert the uniform declarations right before "void main()" */
-    c = s3d_replace( b, "void main()", "uniform P_DEFAULT mat4 u_S3D_ViewProj;\nuniform P_DEFAULT mat4 u_S3D_LightVP;\n"
-        "varying P_DEFAULT vec4 v_S3D_ShadowPos;\nvarying P_DEFAULT float v_S3D_Depth;\nvarying P_DEFAULT vec3 v_S3D_World;\nvoid main()" );
+    c = s3d_replace( b, "void main()", nodes
+        ? "uniform P_DEFAULT mat4 u_S3D_ViewProj;\nuniform P_DEFAULT mat4 u_S3D_LightVP;\nuniform P_DEFAULT vec4 u_S3D_Nodes[72];\n"
+          "varying P_DEFAULT vec4 v_S3D_ShadowPos;\nvarying P_DEFAULT float v_S3D_Depth;\nvarying P_DEFAULT vec3 v_S3D_World;\nvoid main()"
+        : "uniform P_DEFAULT mat4 u_S3D_ViewProj;\nuniform P_DEFAULT mat4 u_S3D_LightVP;\n"
+          "varying P_DEFAULT vec4 v_S3D_ShadowPos;\nvarying P_DEFAULT float v_S3D_Depth;\nvarying P_DEFAULT vec3 v_S3D_World;\nvoid main()" );
     free( b );
     if (!c) return NULL;
 
@@ -1300,7 +1392,7 @@ static const char ** s3d_shell_begin( CoronaShellTransformParams * params, void 
     if (0 != strcmp( params->type, "vertex" )) return params->sources;
 
     {
-        int instanced = 0;
+        int instanced = 0, nodes = 0;
 
         /* effects using the "s3dInst" vertex extension get its attributes declared in their own source segment */
         for (i = 0; i < params->nsources; ++i)
@@ -1310,12 +1402,17 @@ static const char ** s3d_shell_begin( CoronaShellTransformParams * params, void 
             {
                 instanced = 1;
             }
+            if (params->hints[i] && 0 == strcmp( params->hints[i], "extensionAttributes" ) && params->sources[i]
+                && strstr( params->sources[i], "a_s3dNode" ))
+            {
+                nodes = 1;
+            }
         }
     for (i = 0; i < params->nsources; ++i)
     {
         if (params->hints[i] && 0 == strcmp( params->hints[i], "vertexSource" ))
         {
-            char * out = s3d_transform_vertex( params->sources[i], instanced );
+            char * out = s3d_transform_vertex( params->sources[i], instanced, nodes );
 
             if (out)
             {
@@ -1393,6 +1490,9 @@ static int s3d_l_init( lua_State * L )
 
     cmd.reader = s3d_pass_reader;
     if (!CORONA( CoronaRendererRegisterCommand )( L, &cmd, &gPassCmdID )) return s3d_error( L, "s3d: could not register the shadow pass command" );
+
+    cmd.reader = s3d_node_reader;
+    if (!CORONA( CoronaRendererRegisterCommand )( L, &cmd, &gNodeCmdID )) return s3d_error( L, "s3d: could not register the node command" );
 
     /* new Lua state (relaunch): GL objects from the old context may be gone */
     gShadowFbo = gShadowTex = gShadowRb = 0;
@@ -1985,6 +2085,10 @@ typedef struct RigPart {
     unsigned int * node;
     float * lp, * ln;
     float * outP, * outN; /* Lua-owned buffers (the mesh's morph source) */
+    /* GPU path (gltfAttachNodes): node matrices instead of posed vertices */
+    float * outM;          /* Lua-owned: 12 floats per used node (rows of origin/scale * world) */
+    unsigned int * map;    /* Lua-owned: used node -> rig node */
+    unsigned int mapCount;
 } RigPart;
 
 typedef struct Rig {
@@ -2338,6 +2442,51 @@ static int s3d_l_gltf_attach( lua_State * L )
     return 2;
 }
 
+/* s3d._gltfAttachNodes( rig, part (1-based), maxNodes ) -> matrices, positions, normals, indices; or nil when the part
+   uses more than maxNodes nodes. GPU path: positions / normals (buffers) stay in each vertex's node space, indices
+   (table, one per vertex, 0-based) say which of the part's nodes moves it, gltfPose writes the node matrices. */
+static int s3d_l_gltf_attach_nodes( lua_State * L )
+{
+    Rig * rig = s3d_check_rig( L, 1 );
+    unsigned int p = (unsigned int)s3d_optnum( L, 2, 0 ), maxNodes = (unsigned int)s3d_optnum( L, 3, S3D_MAX_NODES );
+    unsigned int used = 0, v, k;
+    unsigned int * slot;
+    RigPart * part;
+    float * lp, * ln;
+
+    if (p < 1 || p > rig->partCount) return s3d_error( L, "s3d: part %u is out of range", p );
+    if (maxNodes > S3D_MAX_NODES) maxNodes = S3D_MAX_NODES;
+    part = &rig->parts[p - 1];
+    slot = (unsigned int *)malloc( ( rig->nodeCount ? rig->nodeCount : 1 ) * sizeof( unsigned int ) );
+    if (!slot) return 0;
+    for (k = 0; k < rig->nodeCount; ++k) slot[k] = 0xFFFFFFFFu;
+    for (v = 0; v < part->count; ++v)
+    {
+        unsigned int ni = part->node[v] < rig->nodeCount ? part->node[v] : 0;
+        if (slot[ni] == 0xFFFFFFFFu) slot[ni] = used++;
+    }
+    if (!used || used > maxNodes) { free( slot ); return 0; }
+
+    part->outM = (float *)lua_newuserdata( L, sizeof( float ) * 12 * used );
+    memset( part->outM, 0, sizeof( float ) * 12 * used );
+    lp = (float *)lua_newuserdata( L, sizeof( float ) * 3 * part->count );
+    ln = (float *)lua_newuserdata( L, sizeof( float ) * 3 * part->count );
+    memcpy( lp, part->lp, sizeof( float ) * 3 * part->count );
+    memcpy( ln, part->ln, sizeof( float ) * 3 * part->count );
+    lua_createtable( L, (int)part->count, 0 );
+    for (v = 0; v < part->count; ++v)
+    {
+        unsigned int ni = part->node[v] < rig->nodeCount ? part->node[v] : 0;
+        lua_pushnumber( L, slot[ni] );
+        lua_rawseti( L, -2, (int)v + 1 );
+    }
+    part->map = (unsigned int *)lua_newuserdata( L, sizeof( unsigned int ) * used );
+    for (k = 0; k < rig->nodeCount; ++k) if (slot[k] != 0xFFFFFFFFu) part->map[slot[k]] = k;
+    part->mapCount = used;
+    free( slot );
+    return 5; /* matrices, positions, normals, indices, map (keep it alive) */
+}
+
 /* s3d._gltfDuration( rig ) -> { seconds per clip } */
 static int s3d_l_gltf_durations( lua_State * L )
 {
@@ -2372,6 +2521,7 @@ static int s3d_l_gltf_clone_rig( lua_State * L )
         RigPart * part = &r->parts[i];
         S3D_RELOC( part->node ); S3D_RELOC( part->lp ); S3D_RELOC( part->ln );
         part->outP = part->outN = NULL;
+        part->outM = NULL; part->map = NULL; part->mapCount = 0;
     }
 #undef S3D_RELOC
     return 1;
@@ -2413,6 +2563,23 @@ static int s3d_l_gltf_pose( lua_State * L )
         float sc = rig->scale;
         unsigned int v;
 
+        if (part->outM)
+        {
+            /* GPU path: rows of origin/scale * world for each node the part uses */
+            unsigned int j;
+            for (j = 0; j < part->mapCount; ++j)
+            {
+                const float * m = rig->world + 16 * part->map[j];
+                float * o = part->outM + 12 * j;
+                int r;
+                for (r = 0; r < 3; ++r)
+                {
+                    o[4 * r] = m[r] * sc; o[4 * r + 1] = m[4 + r] * sc; o[4 * r + 2] = m[8 + r] * sc;
+                    o[4 * r + 3] = ( m[12 + r] - rig->origin[r] ) * sc;
+                }
+            }
+            continue;
+        }
         if (!op || !on) continue;
         for (v = 0; v < part->count; ++v)
         {
@@ -2708,6 +2875,21 @@ static int s3d_l_new_buffer( lua_State * L )
     return 1;
 }
 
+/* s3d._writeBuffer( buf, { numbers... } [, first] ): overwrite floats of a buffer from s3d.newBuffer (1-based first) */
+static int s3d_l_write_buffer( lua_State * L )
+{
+    float * buf = (float *)lua_touserdata( L, 1 );
+    size_t cap, n, i, first;
+
+    if (!buf || LUA_TTABLE != lua_type( L, 2 )) return s3d_error( L, "s3d.writeBuffer: expected a buffer and a table of numbers" );
+    cap = lua_objlen( L, 1 ) / sizeof( float );
+    first = (size_t)( lua_isnumber( L, 3 ) ? lua_tonumber( L, 3 ) : 1 );
+    if (first < 1) first = 1;
+    n = lua_objlen( L, 2 );
+    for (i = 0; i < n && first - 1 + i < cap; ++i) buf[first - 1 + i] = s3d_tablenum( L, 2, (int)i + 1, 0 );
+    return 0;
+}
+
 /* s3d._project( x, y, z ) -> sx, sy (NDC -1..1), depth ; handy for touch / raycasts */
 static int s3d_l_project( lua_State * L )
 {
@@ -2780,6 +2962,7 @@ S3D_EXPORT int luaopen_plugin_s3d( lua_State * L )
     lua_pushcclosure( L, s3d_l_set_camera, 0 ); lua_setfield( L, -2, "setCamera" );
     lua_pushcclosure( L, s3d_l_set_light, 0 ); lua_setfield( L, -2, "setLight" );
     lua_pushcclosure( L, s3d_l_new_buffer, 0 ); lua_setfield( L, -2, "newBuffer" );
+    lua_pushcclosure( L, s3d_l_write_buffer, 0 ); lua_setfield( L, -2, "writeBuffer" );
     lua_pushcclosure( L, s3d_l_project, 0 ); lua_setfield( L, -2, "project" );
     lua_pushcclosure( L, s3d_l_unproject, 0 ); lua_setfield( L, -2, "unproject" );
     lua_pushcclosure( L, s3d_l_set_fog, 0 ); lua_setfield( L, -2, "setFog" );
@@ -2793,6 +2976,7 @@ S3D_EXPORT int luaopen_plugin_s3d( lua_State * L )
     lua_pushcclosure( L, s3d_l_gltf_load, 0 ); lua_setfield( L, -2, "gltfLoad" );
     lua_pushcclosure( L, s3d_l_gltf_set_origin, 0 ); lua_setfield( L, -2, "gltfSetOrigin" );
     lua_pushcclosure( L, s3d_l_gltf_attach, 0 ); lua_setfield( L, -2, "gltfAttach" );
+    lua_pushcclosure( L, s3d_l_gltf_attach_nodes, 0 ); lua_setfield( L, -2, "gltfAttachNodes" );
     lua_pushcclosure( L, s3d_l_gltf_durations, 0 ); lua_setfield( L, -2, "gltfDurations" );
     lua_pushcclosure( L, s3d_l_gltf_pose, 0 ); lua_setfield( L, -2, "gltfPose" );
     lua_pushcclosure( L, s3d_l_gltf_clone_rig, 0 ); lua_setfield( L, -2, "gltfCloneRig" );

@@ -384,6 +384,22 @@ local function defineInstancing()
     return ok ~= false
 end
 
+-- GPU node animation (glTF): every vertex of an animated part carries the index of the node that moves it (per-vertex
+-- vertex extension, no instancing needed); the node matrices go to the vertex shader as a uniform array (see s3d.c).
+-- Each built-in effect a glTF part can use gets a "...node" variant.
+local NODE_EXTENSION = "s3dNodes"
+local NODE_MAX = 24
+local NODE_VARIANT, NODE_BASE = {}, {}
+local function defineNodes()
+    if not graphics.defineVertexExtension then return false end
+    local ok, res = pcall( graphics.defineVertexExtension, { name = NODE_EXTENSION,
+        { name = "s3dNode", type = "float", componentCount = 1 },
+    } )
+    return ok and res ~= false
+end
+M.gpuAnimation = true -- s3d.setGPUAnimation( false ): later loadGLTF calls pose on the CPU
+function M.setGPUAnimation( on ) M.gpuAnimation = on ~= false end
+
 function M.init()
     if inited then return end
     inited = true
@@ -406,6 +422,15 @@ function M.init()
     define( "shadow", M.supported and FRAG_SHADOW or FRAG_UNLIT_NOFOG )
     define( "depth", M.supported and FRAG_DEPTH or FRAG_UNLIT_NOFOG )
     M.instancing = M.supported and defineInstancing() or false
+    M.gpuNodes = M.supported and defineNodes() or false
+    if M.gpuNodes then
+        for _, v in ipairs{ { "lit", FRAG_LIT }, { "unlit", FRAG_UNLIT }, { "reflect", FRAG_REFLECT }, { "sprite", FRAG_SPRITE },
+            { "spritelit", FRAG_SPRITE_LIT }, { "depthsprite", FRAG_DEPTH_SPRITE }, { "shadow", FRAG_SHADOW }, { "depth", FRAG_DEPTH } } do
+            define( v[1] .. "node", v[2], NODE_EXTENSION )
+            NODE_VARIANT["filter.s3d." .. v[1]] = "filter.s3d." .. v[1] .. "node"
+            NODE_BASE["filter.s3d." .. v[1] .. "node"] = "filter.s3d." .. v[1]
+        end
+    end
     if M.instancing then
         define( "litinst", FRAG_LIT, INSTANCE_EXTENSION )
         define( "unlitinst", FRAG_UNLIT, INSTANCE_EXTENSION )
@@ -789,7 +814,9 @@ local EFFECT_USES = {
 
 -- uses = { light = bool, fog = bool, shadow = bool, style = bool } for custom effects (default: light and fog on, shadow and style off)
 function methods:setEffect( name, uses )
-    uses = uses or EFFECT_USES[name] or { light = true, fog = true, shadow = false }
+    local nodes = self._s3dNodes
+    if nodes then name = NODE_VARIANT[name] or name end -- GPU-animated glTF part: the effect's node variant
+    uses = uses or EFFECT_USES[name] or EFFECT_USES[NODE_BASE[name] or ""] or { light = true, fog = true, shadow = false }
     local f = self._s3dFlags or 0
     f = f % 32 -- keep flags 1..16
     if uses.light == false then f = f + 32 end
@@ -803,6 +830,8 @@ function methods:setEffect( name, uses )
     self.fill.effect.s3dNormals = self._s3dNormals
     if self._s3dAO then self.fill.effect.s3dAO = self._s3dAO end
     if self._s3dEnv then self.fill.effect.s3dEnv = self._s3dEnv end
+    if self._s3dMorph then self.fill.effect.s3dMorph = self._s3dMorph end -- animated glTF part: keep its pose
+    if nodes then self.fill.effect.s3dNodes = nodes.m end
     self.fill.effect.s3dFlags = f
     setTransform( self )
     return self
@@ -814,6 +843,15 @@ local function degenerateMesh()
     local ox, oy = m.path:getVertexOffset()
     m.x, m.y = ox, oy
     return m
+end
+
+-- GPU-animated glTF parts (and their shadow copies): the node index of every vertex, + 0 for the degenerate triangle
+local function fillNodeIndices( mesh, idx )
+    local d = mesh.fillExtendedData
+    if not d then return end
+    local n = #idx
+    for i = 1, n do d:setAttributeValue( i, "s3dNode", idx[i] ) end
+    for i = n + 1, n + 3 do d:setAttributeValue( i, "s3dNode", 0 ) end
 end
 
 -- Shadow pass layer of a group: [begin marker, copies..., end marker], always at the bottom (drawn first)
@@ -842,14 +880,21 @@ local function addCaster( obj )
     local ox, oy = c.path:getVertexOffset()
     c.x, c.y = ox, oy
     if obj._s3dInst then c.fillExtension = INSTANCE_EXTENSION end
+    local nodes = obj._s3dNodes
+    if nodes then c.fillExtension = NODE_EXTENSION end
     if ( obj._s3dBillboard or obj._s3dAlphaCut ) and obj._s3dTexture then
         -- sprites and alpha-masked models: the caster needs the image (alpha cut-out) and, for sprites, the current frame's UVs
         c.fill = { type = "image", filename = obj._s3dTexture, baseDir = obj._s3dBaseDir }
-        c.fill.effect = M.EFFECT_DEPTH_SPRITE
+        c.fill.effect = nodes and NODE_VARIANT[M.EFFECT_DEPTH_SPRITE] or M.EFFECT_DEPTH_SPRITE
         c.fill.effect.s3dFlags = 2 + 32 + 64 + 1024 + 128 + ( obj._s3dBillboard or 0 )
     else
-        c.fill.effect = obj._s3dInst and M.EFFECT_DEPTH_INST or M.EFFECT_DEPTH
+        c.fill.effect = obj._s3dInst and M.EFFECT_DEPTH_INST or nodes and NODE_VARIANT[M.EFFECT_DEPTH] or M.EFFECT_DEPTH
         c.fill.effect.s3dFlags = 2 + 32 + 64 + 1024 + 128 -- no cull, shadow pass copy
+    end
+    if nodes then
+        fillNodeIndices( c, nodes.idx )
+        c.fill.effect.s3dMorph = obj._s3dMorph
+        c.fill.effect.s3dNodes = nodes.m
     end
     obj._s3dCaster = c
     if obj._s3dBillboard and obj._s3dUV then obj:_applyUV( c ) end
@@ -897,10 +942,18 @@ function methods:castShadow( on )
     local ox, oy = sh.path:getVertexOffset()
     sh.x, sh.y = ox, oy
     sh:setFillColor( unpack( shadowColor ) )
-    sh.fill.effect = M.EFFECT_SHADOW
+    local nodes = self._s3dNodes
+    if nodes then sh.fillExtension = NODE_EXTENSION end
+    sh.fill.effect = nodes and NODE_VARIANT[M.EFFECT_SHADOW] or M.EFFECT_SHADOW
     -- projected shadow + no light uniforms. Culling stays on: only triangles facing the light remain after projection,
     -- so convex objects never get two layers of shadow.
     sh.fill.effect.s3dFlags = 16 + 32
+    if nodes then
+        -- GPU-animated glTF part: the projection is folded into the node matrices (s3d.c)
+        fillNodeIndices( sh, nodes.idx )
+        sh.fill.effect.s3dMorph = self._s3dMorph
+        sh.fill.effect.s3dNodes = nodes.m
+    end
     self._s3dShadow = sh
     hookFinalize( self )
     setTransform( self )
@@ -1782,7 +1835,14 @@ local lastModelTime
 local function applyMorph( part )
     local mo = part._s3dMorph
     if not mo then return end
-    local function put( o ) if o and o.fill and o.fill.effect then o.fill.effect.s3dMorph = mo end end
+    local nd = part._s3dNodes
+    nd = nd and nd.m
+    local function put( o )
+        if o and o.fill and o.fill.effect then
+            o.fill.effect.s3dMorph = mo
+            if nd then o.fill.effect.s3dNodes = nd end -- GPU path: new node matrices (also redraws the object)
+        end
+    end
     put( part ); put( part._s3dCaster ); put( part._s3dShadow )
 end
 
@@ -1801,8 +1861,10 @@ local function ensureRig( self )
     if self._rigReady then return true end
     if not self._rig then return false end
     for _, part in ipairs( self.parts ) do
-        local outP, outN = C.gltfAttach( self._rig, part._s3dGroup )
-        part._s3dMorph = { outP, outP, 0, outN, outN }
+        if not part._s3dNodes then -- GPU parts were attached when loaded
+            local outP, outN = C.gltfAttach( self._rig, part._s3dGroup )
+            part._s3dMorph = { outP, outP, 0, outN, outN }
+        end
     end
     self._rigReady = true
     return true
@@ -1962,6 +2024,10 @@ function M.loadGLTF( parent, filename, opts )
     else
         model._durations = {}
     end
+    -- GPU node animation: parts moved by at most NODE_MAX nodes keep their vertices in node space and get the node
+    -- matrices every frame; others (and every part when it is off) are posed on the CPU
+    local gpu = model._rig and M.gpuNodes and M.gpuAnimation and opts.gpuAnimation ~= false
+    local anyGPU = false
 
     -- opaque parts first, blended ones last (drawn over what is behind them)
     local order = {}
@@ -1996,7 +2062,16 @@ function M.loadGLTF( parent, filename, opts )
             ao = opts.ao, aoDistance = opts.aoDistance, _aoKey = path .. "|" .. e.i .. "|" .. scale,
         }
         if o.cull == true then o.cull = nil end
-        o._preEffect = function( mesh ) if mask and tex then mesh._s3dAlphaCut = true end end
+        local nodeInfo
+        if gpu then
+            local m, lp, ln, idx, map = C.gltfAttachNodes( model._rig, e.i, NODE_MAX )
+            if m and #idx * 3 == #P then nodeInfo = { m = m, idx = idx, map = map, morph = { lp, lp, 0, ln, ln } } end
+        end
+        if nodeInfo then o._extension = NODE_EXTENSION; anyGPU = true end
+        o._preEffect = function( mesh )
+            if mask and tex then mesh._s3dAlphaCut = true end
+            if nodeInfo then mesh._s3dNodes, mesh._s3dMorph = nodeInfo, nodeInfo.morph end
+        end
 
         -- pixel-art textures (Blockbench): nearest filtering, as the file's sampler asks
         local mag, minf
@@ -2007,10 +2082,18 @@ function M.loadGLTF( parent, filename, opts )
         local part = finalize( e.blend == 1 and blendLayer( parent ) or parent, b, o )
         if mag then display.setDefault( "magTextureFilter", mag ); display.setDefault( "minTextureFilter", minf ) end
         if e.blend == 1 then part:setDepthWrite( false ); part._s3dBlend = true end
+        if nodeInfo then fillNodeIndices( part, nodeInfo.idx ) end
         part._s3dMaterial = mat.name
         part._s3dGroup = e.i
+        part.gpuAnimated = nodeInfo ~= nil
         model.parts[#model.parts + 1] = part
     end
+    if anyGPU then
+        -- the GPU parts show the rest pose until an animation plays
+        C.gltfPose( model._rig, 0, 0 )
+        for i = 1, #model.parts do applyMorph( model.parts[i] ) end
+    end
+    model.gpuAnimated = anyGPU
 
     if opts.castShadow then model:castShadow( true ) end
     if opts.x or opts.y or opts.z then model:moveTo( opts.x or 0, opts.y or 0, opts.z or 0 ) end

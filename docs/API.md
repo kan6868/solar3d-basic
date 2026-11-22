@@ -1,6 +1,6 @@
 # plugin.s3d API reference
 
-Version 0.12.0.
+Version 0.12.1.
 
 ```lua
 local s3d = require( "plugin.s3d" )
@@ -45,6 +45,8 @@ local s3d = require( "plugin.s3d" )
 | `s3d.supported` | `false` on the Vulkan backend. 3D objects are then created hidden and a warning is printed. |
 | `s3d.isSupported()` | Returns `s3d.supported`. |
 | `s3d.isMobile` | `true` on Android, iOS and tvOS. Handy for picking shadow quality. |
+| `s3d.gpuNodes` | `true` when glTF node animation can run on the GPU (set by `init`; needs `graphics.defineVertexExtension`, OpenGL / OpenGL ES backend). See [Animation](#animation). |
+| `s3d.setGPUAnimation( on )` | `false`: glTF models loaded afterwards are posed on the CPU (for comparisons or a misbehaving driver). Default `true`. |
 | `s3d.instancing` | `true` when GPU instancing is available (set by `init`; currently Windows only, `false` on Android). See [Instances](#instances). |
 | `s3d.init()` | Registers the effects and render hooks. Called automatically; calling it again does nothing. Enables `display.setDefault( "enableDepth", true )`. |
 | `s3d.EFFECT_LIT`, `EFFECT_UNLIT`, `EFFECT_REFLECT`, `EFFECT_SKY`, `EFFECT_SPRITE`, `EFFECT_SPRITE_LIT`, `EFFECT_DEPTH_SPRITE`, `EFFECT_LIT_INST`, `EFFECT_UNLIT_INST`, `EFFECT_DEPTH_INST`, `EFFECT_NORMALS`, `EFFECT_SHADOW`, `EFFECT_DEPTH`, `EFFECT_POST` | Effect names (`"filter.s3d.lit"`, ...). See [Effects](#effects). |
@@ -196,9 +198,18 @@ yeti:play( "walk", { fade = 0.25 } )                                     -- cros
 yeti:play( "attack_1", { loop = false, onComplete = function( model, name ) model:play( "idle" ) end } )
 ```
 
-Blockbench-style animations move whole nodes (rigid parts). Every frame the plugin samples the clip's channels, builds
-the nodes' world matrices and transforms each part's vertices in C (about 0.02–0.08 ms per model on a desktop for
-2 000–9 000 vertices); the parts stay one draw call per material. Shadow casters follow the animation.
+Blockbench-style animations move whole nodes (rigid parts). Every frame the plugin samples the clip's channels and
+builds the nodes' world matrices in C. The vertices are then moved **on the GPU**: each vertex keeps its position in its
+node's space plus the index of that node (per-vertex vertex extension `s3dNodes`), and the part's node matrices go to
+the vertex shader as a uniform array right before it is drawn. The CPU work no longer depends on the vertex count
+(S3DDemo's 23 animals: about 0.015 ms per frame instead of 0.44 ms); the parts stay one draw call per material.
+Planar shadows and shadow-map casters follow the animation.
+
+A part moved by more than 24 nodes is posed on the CPU instead (its vertices transformed in C every frame), as are all
+parts when `s3d.gpuNodes` is `false`, when the model is loaded with `gpuAnimation = false` or after
+`s3d.setGPUAnimation( false )`. `model.gpuAnimated` / `part.gpuAnimated` say which path a model / part uses.
+`part:setEffect( name )` on a GPU part picks the effect's node variant (`filter.s3d.litnode`, ...) by itself; a custom
+effect for such a part must declare `vertexExtension = "s3dNodes"`.
 
 - `model:play( name | index, [opts] )`: `loop` (default `true`), `speed` (default 1), `fade` (seconds, default 0.2:
   cross-fade from the clip that is playing; 0 = switch at once), `time` (start time), `onComplete( model, name )`
@@ -208,7 +219,7 @@ the nodes' world matrices and transforms each part's vertices in C (about 0.02�
   `model:getDuration( [name] )`.
 - Fields: `model.animation` (current clip name), `model.animationTime` (seconds).
 - Load options: `animation` (play this clip at once), `loop`, `speed`; `static = true` skips the animation data (less
-  memory, no `play`).
+  memory, no `play`); `gpuAnimation = false` poses this model on the CPU.
 
 Each loaded copy has its own pose; the file is parsed once. Invisible models (`setVisible( false )`) keep their clock
 running but are not posed. Ambient occlusion (when enabled) is baked for the rest pose.
@@ -689,6 +700,7 @@ end )
 | `filter.s3d.sky` | Texture and fill color only, no fog. Used by `newSky`. |
 | `filter.s3d.sprite`, `spritelit`, `depthsprite` | Sprites (`newSprite`): unlit / lit with 50% alpha cut-out, and their shadow-pass version. |
 | `filter.s3d.litinst`, `unlitinst`, `depthinst` | `lit`, `unlit` and shadow-pass `depth` for `newInstances` (vertex extension `s3dInst`). |
+| `filter.s3d.litnode`, `unlitnode`, `reflectnode`, `spritenode`, `spritelitnode`, `depthspritenode`, `shadownode`, `depthnode` | Node variants for GPU-animated glTF parts (vertex extension `s3dNodes`); chosen automatically. |
 | `filter.s3d.normals` | Shows normals as colors, for debugging. |
 | `filter.s3d.shadow` | Used internally for planar shadows. |
 | `filter.s3d.depth` | Used internally for the shadow map pass. |
