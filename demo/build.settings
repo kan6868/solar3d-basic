@@ -35,10 +35,10 @@ settings =
         ["plugin.s3d"] = { publisherId = "com.solartools", 
             supportedPlatforms = {
                 ["win32-sim"] = {
-                    url = "https://github.com/kan6868/solar3d-basic/releases/download/v0.12.0/plugin.s3d-win32-sim.tgz"
+                    url = "https://github.com/kan6868/solar3d/releases/download/v0.12.0/plugin.s3d-win32-sim.tgz"
                 },
                 ["android"] = {
-                    url = "https://github.com/kan6868/solar3d-basic/releases/download/v0.12.0/plugin.s3d-android.tgz"
+                    url = "https://github.com/kan6868/solar3d/releases/download/v0.12.0/plugin.s3d-android.tgz"
                 }
             } 
         },
